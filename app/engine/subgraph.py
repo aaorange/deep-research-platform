@@ -65,6 +65,10 @@ class NoteFn(Protocol):
     async def __call__(self, title: str, pages: list[dict]) -> tuple[WorkerNote, object | None]: ...
 
 
+class CriticalError(Exception):
+    """进程级/基础设施错误（DB 断连、OOM 等）：节点不吞，向上抛出以便检查点恢复。"""
+
+
 class RecorderProtocol(Protocol):
     async def record(
         self,
@@ -107,7 +111,7 @@ def _content_hash(text: str) -> str:
     return hashlib.md5(text.encode()).hexdigest()
 
 
-def build_worker_graph(deps: WorkerDeps):
+def build_worker_graph(deps: WorkerDeps, checkpointer=None):
     async def search_node(state: WorkerState) -> dict:
         task_id = state["task_id"]
         sub_task_id = state.get("sub_task_id")
@@ -155,6 +159,8 @@ def build_worker_graph(deps: WorkerDeps):
         task_id = state["task_id"]
         sub_task_id = state.get("sub_task_id")
         hits = state["hits"][: state.get("max_pages", DEFAULT_MAX_PAGES)]
+        # AsyncSession 禁止并发写；先在协程内收集事件，读完串行落库
+        pending_events: list[tuple[EventType, dict, int | None]] = []
 
         async def read_one(hit: dict) -> dict | None:
             url = hit["url"]
@@ -162,11 +168,17 @@ def build_worker_graph(deps: WorkerDeps):
                 page = await deps.read_page(url)
             except ReadPageError as e:
                 for d in e.degradations:
-                    await deps.recorder.record(
-                        task_id,
-                        EventType.degrade,
-                        {"from": d["tier"], "to": d["fell_to"], "error": d["error"], "url": url},
-                        sub_task_id=sub_task_id,
+                    pending_events.append(
+                        (
+                            EventType.degrade,
+                            {
+                                "from": d["tier"],
+                                "to": d["fell_to"],
+                                "error": d["error"],
+                                "url": url,
+                            },
+                            None,
+                        )
                     )
                 return None
             except Exception as e:  # noqa: BLE001
@@ -174,23 +186,26 @@ def build_worker_graph(deps: WorkerDeps):
                 return None
 
             cred = credibility_for_url(url)
-            await deps.recorder.record(
-                task_id,
-                EventType.fetch,
-                {**page_to_event(page), "domain": cred.domain, "credibility": cred.score},
-                sub_task_id=sub_task_id,
-                latency_ms=page.latency_ms,
+            pending_events.append(
+                (
+                    EventType.fetch,
+                    {
+                        **page_to_event(page),
+                        "domain": cred.domain,
+                        "credibility": cred.score,
+                    },
+                    page.latency_ms,
+                )
             )
             for payload in degradation_events(page):
-                await deps.recorder.record(
-                    task_id,
-                    EventType.degrade,
-                    {**payload, "url": url},
-                    sub_task_id=sub_task_id,
-                )
+                pending_events.append((EventType.degrade, {**payload, "url": url}, None))
             return {"page": page, "hit": hit, "cred": cred}
 
         results = await asyncio.gather(*[read_one(h) for h in hits])
+        for etype, payload, latency_ms in pending_events:
+            await deps.recorder.record(
+                task_id, etype, payload, sub_task_id=sub_task_id, latency_ms=latency_ms
+            )
 
         pages: list[dict] = []
         sources: list[dict] = []
@@ -248,6 +263,8 @@ def build_worker_graph(deps: WorkerDeps):
         sub_task_id = state.get("sub_task_id")
         try:
             note, usage = await deps.write_note(state["title"], state["pages"])
+        except CriticalError:
+            raise  # 进程级错误不吞：让 LangGraph 记录检查点后中断，重启可恢复
         except Exception as e:  # noqa: BLE001
             logger.warning("note node failed: %s", e)
             await deps.recorder.record(
@@ -256,6 +273,7 @@ def build_worker_graph(deps: WorkerDeps):
                 {"stage": "note", "error": f"{type(e).__name__}: {e}"},
                 sub_task_id=sub_task_id,
             )
+            # 业务异常（含 schema 校验重试耗尽）不抛出，标记 error 走 END
             return {"error": f"note generation failed: {e}"}
 
         tokens = getattr(usage, "total_tokens", None)
@@ -306,4 +324,4 @@ def build_worker_graph(deps: WorkerDeps):
     graph.add_conditional_edges("search", after_search)
     graph.add_conditional_edges("read", after_read)
     graph.add_edge("note", END)
-    return graph.compile()
+    return graph.compile(checkpointer=checkpointer)
