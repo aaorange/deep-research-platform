@@ -15,6 +15,9 @@ dependencies = [
     "ddgs>=9.16.0",
     "crawl4ai>=0.9.3",
     "trafilatura>=2.2.0",
+    "langgraph>=1.2.11",
+    "instructor>=1.17.0",
+    "openai>=2.0,<3.0",
 ]
 
 [dependency-groups]
