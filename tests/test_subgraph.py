@@ -295,3 +295,72 @@ async def test_max_pages_limit():
 
     assert len(final["pages"]) == 2
     assert len(note.calls[0][1]) == 2  # write_note 只收到 2 页
+
+
+class FakePersister:
+    def __init__(self):
+        self.calls = []
+
+    async def persist_sources(self, task_id, sources):
+        self.calls.append(("sources", task_id, sources))
+        return {s["idx"]: 100 + s["idx"] for s in sources}
+
+    async def persist_note(self, task_id, sub_task_id, note, idx_to_id):
+        self.calls.append(("note", task_id, sub_task_id, note, idx_to_id))
+        return 999
+
+    async def add_usage(self, task_id, model, prompt_tokens, completion_tokens):
+        self.calls.append(("usage", task_id, model, prompt_tokens, completion_tokens))
+
+
+async def test_persister_wired_into_note_node():
+    hits = [
+        SearchHit(title="甲", url="https://www.thepaper.cn/a", snippet="s"),
+        SearchHit(title="乙", url="https://36kr.com/b", snippet="s"),
+    ]
+    persister = FakePersister()
+    deps = WorkerDeps(
+        search=make_search(hits),
+        read_page=make_read(),
+        write_note=make_note(),
+        recorder=FakeRecorder(),
+        persister=persister,
+    )
+
+    graph = build_worker_graph(deps)
+    final = await graph.ainvoke({"task_id": 5, "sub_task_id": 9, "title": "标题"})
+
+    assert final["note_db_id"] == 999
+
+    kinds = [c[0] for c in persister.calls]
+    assert kinds == ["sources", "note", "usage"]
+
+    sources_call = persister.calls[0]
+    assert sources_call[1] == 5
+    assert len(sources_call[2]) == 2
+    for s in sources_call[2]:
+        assert "freshness" in s
+        assert "freshness_basis" in s
+
+    usage_call = persister.calls[2]
+    assert usage_call[2] == "deepseek-chat"
+    assert usage_call[3] == 3000  # FakeNote usage.prompt_tokens
+    assert usage_call[4] == 400
+
+    note_call = persister.calls[1]
+    assert note_call[2] == 9
+    assert note_call[4] == {1: 101, 2: 102}  # idx_to_id 传给锚点重写
+
+
+async def test_no_persister_skips_persist():
+    deps = make_deps(
+        make_search([SearchHit(title="t", url="https://a.com/1", snippet="s")]),
+        make_read(),
+        make_note(),
+    )
+
+    graph = build_worker_graph(deps)
+    final = await graph.ainvoke({"task_id": 1, "sub_task_id": 7, "title": "标题"})
+
+    assert final.get("error") is None
+    assert final["note_db_id"] is None

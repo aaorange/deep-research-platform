@@ -15,8 +15,10 @@ from typing import Literal, Protocol, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
+from app.config import get_settings
 from app.db import EventType
 from app.engine.schemas import WorkerNote
+from app.engine.scoring import freshness_score
 from app.tools.credibility import credibility_for_url
 from app.tools.read_page import (
     PageContent,
@@ -47,6 +49,7 @@ class WorkerState(TypedDict, total=False):
     sources: list[dict]
     note: dict
     note_tokens: int
+    note_db_id: int | None
     error: str | None
 
 
@@ -75,12 +78,29 @@ class RecorderProtocol(Protocol):
     ) -> object: ...
 
 
+class PersisterProtocol(Protocol):
+    async def persist_sources(self, task_id: int, sources: list[dict]) -> dict[int, int]: ...
+
+    async def persist_note(
+        self,
+        task_id: int,
+        sub_task_id: int | None,
+        note: dict,
+        idx_to_id: dict[int, int],
+    ) -> int: ...
+
+    async def add_usage(
+        self, task_id: int, model: str, prompt_tokens: int, completion_tokens: int
+    ) -> None: ...
+
+
 @dataclass
 class WorkerDeps:
     search: SearchFn
     read_page: ReadFn
     write_note: NoteFn
     recorder: RecorderProtocol
+    persister: PersisterProtocol | None = None  # None = 不落库（纯测试）
 
 
 def _content_hash(text: str) -> str:
@@ -189,7 +209,17 @@ def build_worker_graph(deps: WorkerDeps):
             seen_hashes.add(digest)
             idx = len(pages) + 1
             title = page.title or hit.get("title") or ""
-            pages.append({"idx": idx, "title": title, "credibility": cred.score, "text": page.text})
+            date_str = getattr(page, "published_date", None)
+            fresh, fresh_basis = freshness_score(date_str, page.url)
+            pages.append(
+                {
+                    "idx": idx,
+                    "title": title,
+                    "credibility": cred.score,
+                    "published_date": date_str,
+                    "text": page.text,
+                }
+            )
             sources.append(
                 {
                     "idx": idx,
@@ -197,6 +227,8 @@ def build_worker_graph(deps: WorkerDeps):
                     "title": title,
                     "domain": cred.domain,
                     "credibility": cred.score,
+                    "freshness": fresh,
+                    "freshness_basis": fresh_basis,
                     "content_hash": digest,
                 }
             )
@@ -239,7 +271,26 @@ def build_worker_graph(deps: WorkerDeps):
             sub_task_id=sub_task_id,
             tokens=tokens,
         )
-        return {"note": note.model_dump(), "note_tokens": tokens or 0}
+
+        note_db_id: int | None = None
+        if deps.persister is not None:
+            idx_to_id = await deps.persister.persist_sources(task_id, state["sources"])
+            note_db_id = await deps.persister.persist_note(
+                task_id, sub_task_id, note.model_dump(), idx_to_id
+            )
+            if usage is not None:
+                await deps.persister.add_usage(
+                    task_id,
+                    get_settings().llm_model_chat,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                )
+
+        return {
+            "note": note.model_dump(),
+            "note_tokens": tokens or 0,
+            "note_db_id": note_db_id,
+        }
 
     def after_search(state: WorkerState) -> Literal["read", "__end__"]:
         return "__end__" if state.get("error") else "read"
