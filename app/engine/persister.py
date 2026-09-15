@@ -7,7 +7,7 @@ DeepSeek 官方定价（2025，缓存未命中）：
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import (
@@ -38,15 +38,35 @@ class SubTaskPersister:
     def __init__(self, session: AsyncSession):
         self.session = session
 
-    async def create_sub_tasks(self, task_id: int, sub_tasks: list[dict]) -> list[dict]:
-        """大纲落库 sub_tasks 表，返回含 id 的行（保持传入顺序）。"""
+    async def create_sub_tasks(
+        self, task_id: int, sub_tasks: list[dict], round_no: int = 1
+    ) -> list[dict]:
+        """大纲落库 sub_tasks 表（round_no=1 首轮，≥2 反思补充轮）。"""
         rows = [
-            SubTask(task_id=task_id, title=s["title"], keywords=s.get("keywords"))
+            SubTask(
+                task_id=task_id, title=s["title"], keywords=s.get("keywords"), round_no=round_no
+            )
             for s in sub_tasks
         ]
         self.session.add_all(rows)
         await self.session.commit()
         return [{"id": r.id, "title": r.title, "keywords": r.keywords} for r in rows]
+
+    async def all_sub_tasks(self, task_id: int) -> list[dict]:
+        """全部子任务（含状态与轮次），reflect 检查清单用。"""
+        result = await self.session.execute(
+            select(SubTask).where(SubTask.task_id == task_id).order_by(SubTask.id)
+        )
+        return [
+            {
+                "id": r.id,
+                "title": r.title,
+                "keywords": r.keywords,
+                "status": r.status.value if hasattr(r.status, "value") else str(r.status),
+                "round_no": r.round_no,
+            }
+            for r in result.scalars().all()
+        ]
 
     async def pending_sub_tasks(self, task_id: int) -> list[dict]:
         """待执行子任务：pending + 崩溃残留的 running（resume 时重跑）。"""
@@ -206,5 +226,70 @@ class SubTaskPersister:
                 error_msg=error,
                 finished_at=datetime.now(UTC),
             )
+        )
+        await self.session.commit()
+
+    # ---- 追加指示信箱（JSONB 读改写，追加竞态窗口为毫秒级，可接受） ----
+
+    async def append_instruction(self, task_id: int, instruction_text: str) -> dict:
+        """追加一条指示：{id, text, created_at, consumed_round: null}。"""
+        task = await self.session.get(ResearchTask, task_id)
+        inbox: list[dict] = list(task.extra_instructions or [])
+        next_id = max((int(i.get("id", 0)) for i in inbox), default=0) + 1
+        item = {
+            "id": next_id,
+            "text": instruction_text,
+            "created_at": datetime.now(UTC).isoformat(),
+            "consumed_round": None,
+        }
+        inbox.append(item)
+        task.extra_instructions = inbox
+        await self.session.commit()
+        return item
+
+    async def pending_instructions(self, task_id: int) -> list[dict]:
+        """未消费的追加指示，按 id 升序。
+
+        populate_existing 强制回库：mark_instructions_consumed 的 raw UPDATE
+        绕过 ORM，identity map 里的旧值会让指示被重复消费。
+        """
+        task = (
+            (
+                await self.session.execute(
+                    select(ResearchTask)
+                    .where(ResearchTask.id == task_id)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if not task or not task.extra_instructions:
+            return []
+        return [i for i in task.extra_instructions if i.get("consumed_round") is None]
+
+    async def mark_instructions_consumed(self, task_id: int, round_no: int) -> None:
+        """原子消费：单条 UPDATE 在服务端完成，避免与 API 追加并发丢失。
+
+        round_no 显式 CAST：jsonb_build_object 参数类型无法推断。
+        """
+        await self.session.execute(
+            text("""
+                UPDATE research_tasks
+                SET extra_instructions = COALESCE((
+                    SELECT jsonb_agg(
+                        CASE WHEN elem->>'consumed_round' IS NULL
+                             THEN elem || jsonb_build_object(
+                                 'consumed_round', CAST(:round_no AS integer)
+                             )
+                             ELSE elem
+                        END
+                        ORDER BY (elem->>'id')::int
+                    )
+                    FROM jsonb_array_elements(extra_instructions) AS elem
+                ), '[]'::jsonb)
+                WHERE id = :task_id
+            """),
+            {"task_id": task_id, "round_no": round_no},
         )
         await self.session.commit()

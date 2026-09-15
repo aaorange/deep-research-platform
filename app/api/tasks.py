@@ -4,9 +4,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import ResearchTask, TaskStatus
 from app.db.base import get_session
+from app.engine.persister import SubTaskPersister
 from app.engine.planner import DEPTH_BUDGETS
 from app.queue import enqueue_research, get_queue
-from app.schemas.task import TaskControl, TaskCreate, TaskDetail, TaskOut
+from app.schemas.task import (
+    InstructionCreate,
+    InstructionOut,
+    TaskControl,
+    TaskCreate,
+    TaskDetail,
+    TaskOut,
+)
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
 
@@ -46,6 +54,22 @@ async def get_task(task_id: int, session: AsyncSession = Depends(get_session)) -
         raise HTTPException(status_code=404, detail="task not found")
     await session.refresh(task, attribute_names=["sub_tasks"])
     return task
+
+
+@router.post("/{task_id}/instructions", response_model=InstructionOut, status_code=201)
+async def add_instruction(
+    task_id: int, body: InstructionCreate, session: AsyncSession = Depends(get_session)
+) -> dict:
+    """追加研究指示：写入信箱，由执行中的 reflect 节点在下一轮消费。"""
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status in (TaskStatus.done, TaskStatus.canceled, TaskStatus.stopped):
+        raise HTTPException(
+            status_code=409, detail=f"task in terminal status '{task.status.value}'"
+        )
+    persister = SubTaskPersister(session)
+    return await persister.append_instruction(task_id, body.text)
 
 
 @router.post("/{task_id}/control", response_model=TaskOut)

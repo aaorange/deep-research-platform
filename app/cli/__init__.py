@@ -110,6 +110,11 @@ async def run_full(question: str, background: str, depth: str, max_pages: int) -
         f"✓ 状态 {final['status']} | {final['notes']} 份笔记 / {final['sources']} 条信源"
         f" / {final['worker_errors']} 个失败子任务"
     )
+    if final.get("supplemented"):
+        print(
+            f"✓ 反思 {final['reflect_rounds']} 轮：补充 {final['supplemented']} 个子任务"
+            "（缺口检测 + 追加指示）"
+        )
     if final["report_id"]:
         print(
             f"✓ 报告 #{final['report_id']}：{final['report_chars']} 字 / "

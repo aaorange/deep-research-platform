@@ -11,6 +11,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -64,6 +65,12 @@ class ResearchTask(Base):
     cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
     event_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error_msg: Mapped[str | None] = mapped_column(Text, default=None)
+    extra_instructions: Mapped[list | None] = mapped_column(
+        JSONB,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+        comment="追加指示信箱：[{id, text, created_at, consumed_round}]，reflect 节点消费",
+    )
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[DateTime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -75,6 +82,11 @@ class ResearchTask(Base):
     sources: Mapped[list["Source"]] = relationship(back_populates="task")
     notes: Mapped[list["Note"]] = relationship(back_populates="task")
     reports: Mapped[list["Report"]] = relationship(back_populates="task")
+
+    @property
+    def instructions(self) -> list:
+        """追加指示信箱（TaskDetail 序列化用）。"""
+        return self.extra_instructions or []
 
 
 class SubTask(Base):

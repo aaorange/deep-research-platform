@@ -1,6 +1,6 @@
 """任务执行编排器：CLI 与 arq worker 共用的执行入口。
 
-职责：置 running → 跑主图（plan → execute → synthesize）→ 回写终态。
+职责：置 running → 跑主图（plan → execute → reflect → synthesize）→ 回写终态。
 图执行异常时置 failed 并向上抛出（调用方决定是否重试/上报）。
 """
 
@@ -12,6 +12,7 @@ from app.engine.checkpoint import open_graph_checkpointer, thread_id_for_task
 from app.engine.main_graph import DEFAULT_MAX_PAGES, OrchestratorDeps, build_main_graph
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import write_plan
+from app.engine.reflector import reflect_on_coverage
 from app.engine.runner import make_sub_task_runner
 from app.engine.synthesizer import write_report
 from app.services.event_recorder import EventRecorder
@@ -49,6 +50,7 @@ async def execute_research(
             write_plan=write_plan,
             run_worker=make_sub_task_runner(verbose=verbose),
             write_report=write_report,
+            reflect=reflect_on_coverage,
             recorder=recorder,
             store=persister,
         )
@@ -76,14 +78,19 @@ async def execute_research(
         else:
             await persister.finish_task(task_id, done=True)
 
+        # 补充轮后 state 只含末轮产物，笔记/信源从 DB 取全量
+        all_notes, all_sources = await persister.synthesis_inputs(task_id)
+
         await session.refresh(task)
         return {
             "task_id": task_id,
             "status": task.status.value,
             "executed": final.get("executed", 0),
-            "notes": len(final.get("notes") or []),
-            "sources": len(final.get("sources") or []),
+            "notes": len(all_notes),
+            "sources": len(all_sources),
             "worker_errors": len(final.get("worker_errors") or []),
+            "reflect_rounds": final.get("reflect_rounds", 0),
+            "supplemented": final.get("supplemented", 0),
             "report_id": final.get("report_id"),
             "report_chars": final.get("report_chars", 0),
             "citations": final.get("citations", 0),

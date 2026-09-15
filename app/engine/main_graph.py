@@ -1,14 +1,17 @@
-"""主图（W2）：plan（大纲生成）→ execute（并行 fan-out）。
+"""主图（W2）：plan（大纲生成）→ execute（并行 fan-out）→ reflect → synthesize。
 
-D8 范围只实现前两个节点，D9 在 execute 后接 synthesize、D10 加 reflect，
-接口按四节点主图设计，后续节点在此图上扩展。
+reflect 在每轮 execute 后对照 checklist 检测缺口：LLM 评估覆盖度 + 消费追加
+指示信箱，产出补充轮子任务（round_no ≥ 2）后回到 execute；无缺口或到达
+补充轮上限（≤2）进入 synthesize。接口按四节点主图设计。
 
 并行策略：asyncio.gather 在 execute 节点内 fan-out，每个 worker 跑 W1 子图，
 结果由 merge_worker_results（"笔记 reducer"）合并——不走 LangGraph Send，
 规避并行分支的 reducer 语义坑（见执行方案第 6 章风险预案）。
 
 resume 语义：execute 每次进入从 store 读 pending 子任务，已完成/已失败的不重跑；
-崩溃残留的 running 状态视为待执行。检查点由调用方（CLI/D9 worker）注入。
+崩溃残留的 running 状态视为待执行。reflect/synthesize 的输入一律从 DB 读
+（state 只作路由与展示），崩溃恢复或补充轮重入都能拿到全量历史产物。
+检查点由调用方（CLI/D9 worker）注入。
 """
 
 import asyncio
@@ -21,11 +24,14 @@ from langgraph.graph import END, START, StateGraph
 from app.config import get_settings
 from app.db import EventType
 from app.engine.planner import DEPTH_SUBTASK_COUNT, PlanOutline, default_outline
+from app.engine.reflector import Reflection, instruction_to_sub_task
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_PAGES = 3
 DEFAULT_MAX_PARALLEL = 5
+MAX_REFLECT_ROUNDS = 2  # 补充轮上限（不含首轮 execute）
+MAX_GAPS_PER_ROUND = 3
 
 
 class MainState(TypedDict, total=False):
@@ -41,11 +47,17 @@ class MainState(TypedDict, total=False):
     plan_fallback: bool
     plan_tokens: int
 
-    # execute 节点输出（reducer 合并）
+    # execute 节点输出（reducer 合并，仅当前轮次）
     executed: int
     notes: list[dict]
     sources: list[dict]
     worker_errors: list[dict]
+
+    # reflect 节点输出
+    reflect_rounds: int  # 已执行的反思轮数
+    need_more: bool  # 本轮是否产出了补充子任务（路由 execute/synthesize）
+    supplemented: int  # 累计补充子任务数（缺口 + 追加指示）
+    gap_history: list[dict]  # 每轮评估摘要 [{round, assessment, created}]
 
     # synthesize 节点输出
     report_id: int | None
@@ -69,10 +81,29 @@ class ReportFn(Protocol):
     ) -> tuple[object, object | None]: ...
 
 
+class ReflectFn(Protocol):
+    async def __call__(
+        self,
+        question: str,
+        background: str | None,
+        sub_tasks: list[dict],
+        notes: list[dict],
+        sources: list[dict],
+    ) -> tuple[Reflection, object | None]: ...
+
+
 class SubTaskStoreProtocol(Protocol):
-    async def create_sub_tasks(self, task_id: int, sub_tasks: list[dict]) -> list[dict]: ...
+    async def create_sub_tasks(
+        self, task_id: int, sub_tasks: list[dict], round_no: int = 1
+    ) -> list[dict]: ...
 
     async def pending_sub_tasks(self, task_id: int) -> list[dict]: ...
+
+    async def all_sub_tasks(self, task_id: int) -> list[dict]: ...
+
+    async def pending_instructions(self, task_id: int) -> list[dict]: ...
+
+    async def mark_instructions_consumed(self, task_id: int, round_no: int) -> None: ...
 
     async def synthesis_inputs(self, task_id: int) -> tuple[list[dict], list[dict]]: ...
 
@@ -103,6 +134,7 @@ class OrchestratorDeps:
     write_plan: PlanFn
     run_worker: WorkerRunner
     write_report: ReportFn
+    reflect: ReflectFn
     recorder: RecorderProtocol
     store: SubTaskStoreProtocol
     max_parallel: int = DEFAULT_MAX_PARALLEL
@@ -224,6 +256,110 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
     def after_plan(state: MainState) -> Literal["execute", "__end__"]:
         return "execute" if state.get("sub_tasks") else "__end__"
 
+    async def reflect_node(state: MainState) -> dict:
+        """缺口检测：LLM 覆盖度评估 + 消费追加指示 → 补充轮子任务。
+
+        输入一律从 DB 读（笔记/信源/子任务状态/信箱），补充轮重入与
+        崩溃恢复后拿到的都是全量历史。LLM 失败不阻断主链路——记录后
+        照常进入 synthesize（报告仍可基于现有材料产出）。
+        """
+        task_id = state["task_id"]
+        rounds = state.get("reflect_rounds", 0)
+
+        if rounds >= MAX_REFLECT_ROUNDS:
+            await deps.recorder.record(
+                task_id, EventType.reflect, {"round": rounds, "skip": "max_rounds", "created": 0}
+            )
+            return {"need_more": False}
+
+        notes, sources = await deps.store.synthesis_inputs(task_id)
+        sub_tasks = await deps.store.all_sub_tasks(task_id)
+        instructions = await deps.store.pending_instructions(task_id)
+
+        if not notes and not instructions:
+            await deps.recorder.record(
+                task_id,
+                EventType.reflect,
+                {"round": rounds + 1, "skip": "no_notes", "created": 0},
+            )
+            return {
+                "reflect_rounds": rounds + 1,
+                "need_more": False,
+                "supplemented": state.get("supplemented", 0),
+                "gap_history": state.get("gap_history", []),
+            }
+
+        reflection: Reflection | None = None
+        usage = None
+        if notes:
+            try:
+                reflection, usage = await deps.reflect(
+                    state["question"], state.get("background"), sub_tasks, notes, sources
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("reflect node failed, continue to synthesize: %s", e)
+                await deps.recorder.record(
+                    task_id,
+                    EventType.control,
+                    {"stage": "reflect", "error": f"{type(e).__name__}: {e}"},
+                )
+            if usage is not None:
+                await deps.store.add_usage(
+                    task_id,
+                    get_settings().llm_model_chat,
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
+                )
+
+        gap_tasks: list[dict] = []
+        if reflection is not None and reflection.has_gaps:
+            gap_tasks = [g.model_dump() for g in reflection.gaps[:MAX_GAPS_PER_ROUND]]
+
+        round_no = rounds + 2  # 首轮 execute 为 round 1，补充轮从 2 起
+        created: list[dict] = []
+        if instructions:
+            created += await deps.store.create_sub_tasks(
+                task_id, [instruction_to_sub_task(i["text"]) for i in instructions], round_no
+            )
+            await deps.store.mark_instructions_consumed(task_id, round_no)
+        if gap_tasks:
+            created += await deps.store.create_sub_tasks(task_id, gap_tasks, round_no)
+
+        await deps.recorder.record(
+            task_id,
+            EventType.reflect,
+            {
+                "round": rounds + 1,
+                "assessment": reflection.assessment if reflection else "",
+                "has_gaps": bool(gap_tasks),
+                "gap_titles": [g["title"] for g in gap_tasks],
+                "instructions": len(instructions),
+                "created": len(created),
+                "next_round": round_no if created else None,
+            },
+            tokens=usage.total_tokens if usage else None,
+        )
+        return {
+            "reflect_rounds": rounds + 1,
+            "need_more": bool(created),
+            "supplemented": state.get("supplemented", 0) + len(created),
+            "gap_history": state.get("gap_history", [])
+            + [
+                {
+                    "round": rounds + 1,
+                    "assessment": reflection.assessment if reflection else "",
+                    "created": len(created),
+                }
+            ],
+        }
+
+    def after_reflect(state: MainState) -> Literal["execute", "synthesize"]:
+        # reflect_rounds ≤ 上限才允许再进 execute：否则本轮创建的补充任务
+        # 将永远悬挂（第 N+1 次反思才被 skip 拦住）
+        if state.get("need_more") and state.get("reflect_rounds", 0) <= MAX_REFLECT_ROUNDS:
+            return "execute"
+        return "synthesize"
+
     async def synthesize_node(state: MainState) -> dict:
         task_id = state["task_id"]
         # 从 DB 读全量笔记/信源（非 state）：resume 后续跑也拿得到历史轮产物
@@ -272,9 +408,11 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
     graph = StateGraph(MainState)
     graph.add_node("plan", plan_node)
     graph.add_node("execute", execute_node)
+    graph.add_node("reflect", reflect_node)
     graph.add_node("synthesize", synthesize_node)
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", after_plan)
-    graph.add_edge("execute", "synthesize")
+    graph.add_edge("execute", "reflect")
+    graph.add_conditional_edges("reflect", after_reflect)
     graph.add_edge("synthesize", END)
     return graph.compile(checkpointer=checkpointer)

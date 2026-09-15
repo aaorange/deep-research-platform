@@ -8,17 +8,29 @@ from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.db import Base, Report, ResearchTask, SubTaskStatus, TaskStatus
+from app.db import (
+    AgentEvent,
+    Base,
+    EventType,
+    Report,
+    ResearchTask,
+    SubTask,
+    SubTaskStatus,
+    TaskStatus,
+)
 from app.engine import orchestrator
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import PlanOutline, PlanSubTask
+from app.engine.reflector import Reflection, SupplementaryTask
 from app.worker import run_research_task
 
 TEST_DB_URL = "postgresql+asyncpg://research:research@localhost:5432/research_test"
 
 PLAN_USAGE = SimpleNamespace(prompt_tokens=500, completion_tokens=80, total_tokens=580)
+REFLECT_USAGE = SimpleNamespace(prompt_tokens=200, completion_tokens=50, total_tokens=250)
 REPORT_USAGE = SimpleNamespace(prompt_tokens=800, completion_tokens=1500, total_tokens=2300)
 
 
@@ -117,7 +129,22 @@ def make_fake_worker(maker, fail_all=False):
     return run_worker
 
 
-def patch_all(monkeypatch, maker, fail_all=False):
+def fake_reflect(has_gaps=False):
+    async def reflect(question, background, sub_tasks, notes, sources):
+        gaps = (
+            [SupplementaryTask(title="补搜缺数据维度", keywords="补搜 关键数据")]
+            if has_gaps and notes
+            else []
+        )
+        return (
+            Reflection(has_gaps=bool(gaps), assessment="缺数据" if gaps else "材料充分", gaps=gaps),
+            REFLECT_USAGE,
+        )
+
+    return reflect
+
+
+def patch_all(monkeypatch, maker, fail_all=False, reflect=None):
     outline = PlanOutline(
         sub_tasks=[PlanSubTask(title=f"子问题{i}", keywords=f"k{i}") for i in range(1, 4)]
     )
@@ -128,6 +155,7 @@ def patch_all(monkeypatch, maker, fail_all=False):
         lambda verbose=False: make_fake_worker(maker, fail_all),
     )
     monkeypatch.setattr(orchestrator, "write_report", fake_report())
+    monkeypatch.setattr(orchestrator, "reflect_on_coverage", reflect or fake_reflect())
     monkeypatch.setattr(
         orchestrator, "open_graph_checkpointer", lambda: nullcontext(InMemorySaver())
     )
@@ -143,10 +171,12 @@ async def test_execute_research_full_lifecycle(session_maker, monkeypatch):
     assert result["executed"] == 3
     assert result["notes"] == 3
     assert result["sources"] == 3
+    assert result["reflect_rounds"] == 1
+    assert result["supplemented"] == 0
     assert result["report_id"] == 1
     assert result["citations"] == 1
-    # plan + reasoner 两笔计费
-    assert result["token_used"] == 580 + 2300
+    # plan + reflect + reasoner 三笔计费
+    assert result["token_used"] == 580 + 250 + 2300
 
     async with session_maker() as session:
         task = await session.get(ResearchTask, task_id)
@@ -157,6 +187,54 @@ async def test_execute_research_full_lifecycle(session_maker, monkeypatch):
         assert report.markdown == "# 报告\n\n结论 [1]。"
         assert report.citation_map == {"1": 1}
         assert report.token_total == 2300
+        sub_tasks = list(await session.scalars(select(SubTask).where(SubTask.task_id == task_id)))
+        assert all(st.round_no == 1 for st in sub_tasks)
+        assert all(st.status == SubTaskStatus.done for st in sub_tasks)
+
+
+async def test_execute_research_consumes_instruction(session_maker, monkeypatch):
+    """追加指示全链路：信箱 → reflect 消费 → round 2 子任务 → 笔记入综合。"""
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        task.extra_instructions = [
+            {"id": 1, "text": "重点补充 2025 年融资数据", "created_at": "t", "consumed_round": None}
+        ]
+        await session.commit()
+
+    patch_all(monkeypatch, session_maker)
+
+    result = await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    assert result["status"] == "done"
+    assert result["supplemented"] == 1
+    assert result["reflect_rounds"] == 2
+    assert result["notes"] == 4  # 首轮 3 + 指示补搜 1
+    assert result["report_id"] == 1
+
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        assert task.extra_instructions[0]["consumed_round"] == 2
+        rows = list(
+            await session.scalars(
+                select(SubTask).where(SubTask.task_id == task_id).order_by(SubTask.id)
+            )
+        )
+        assert [st.round_no for st in rows] == [1, 1, 1, 2]
+        assert rows[3].title == "重点补充 2025 年融资数据"
+        assert rows[3].status == SubTaskStatus.done
+        # 反思事件两轮入 agent_events（动作流可见，JSONB 读出即 dict）
+        events = list(
+            await session.scalars(
+                select(AgentEvent)
+                .where(AgentEvent.task_id == task_id, AgentEvent.type == EventType.reflect)
+                .order_by(AgentEvent.seq)
+            )
+        )
+        assert [e.payload["round"] for e in events] == [1, 2]
+        consumed = events[0].payload
+        assert consumed["instructions"] == 1
+        assert consumed["next_round"] == 2
 
 
 async def test_execute_research_marks_failed_when_no_notes(session_maker, monkeypatch):
