@@ -69,7 +69,20 @@ class SubTaskPersister:
         ]
 
     async def pending_sub_tasks(self, task_id: int) -> list[dict]:
-        """待执行子任务：pending + 崩溃残留的 running（resume 时重跑）。"""
+        """待执行子任务：pending + 崩溃残留的 running（resume 时重跑）。
+
+        自愈：running 且已落笔记（崩溃窗口内笔记已持久化但状态未回写）→
+        置 done，resume 重入时不会重跑该子任务、不产生重复笔记。
+        """
+        await self.session.execute(
+            text("""
+                UPDATE sub_tasks SET status = 'done'
+                WHERE task_id = :tid AND status = 'running'
+                  AND EXISTS (SELECT 1 FROM notes WHERE notes.sub_task_id = sub_tasks.id)
+            """),
+            {"tid": task_id},
+        )
+        await self.session.commit()
         result = await self.session.execute(
             select(SubTask)
             .where(
@@ -81,6 +94,34 @@ class SubTaskPersister:
         return [
             {"id": r.id, "title": r.title, "keywords": r.keywords} for r in result.scalars().all()
         ]
+
+    async def skip_pending_sub_tasks(self, task_id: int) -> int:
+        """预算降级：pending/running 全部置 skipped，返回跳过数。"""
+        result = await self.session.execute(
+            update(SubTask)
+            .where(
+                SubTask.task_id == task_id,
+                SubTask.status.in_([SubTaskStatus.pending, SubTaskStatus.running]),
+            )
+            .values(status=SubTaskStatus.skipped, error_msg="budget degraded")
+        )
+        await self.session.commit()
+        return result.rowcount or 0
+
+    async def task_budget_state(self, task_id: int) -> tuple[int, int]:
+        """新鲜读 (token_used, token_budget)：列级 SELECT 不走 identity map。
+
+        add_usage 是 raw UPDATE 绕过 ORM，session.get 会命中陈旧值；
+        预算判定每次都要读到最新累计。
+        """
+        row = (
+            await self.session.execute(
+                select(ResearchTask.token_used, ResearchTask.token_budget).where(
+                    ResearchTask.id == task_id
+                )
+            )
+        ).first()
+        return (row.token_used, row.token_budget) if row else (0, 0)
 
     async def mark_sub_task_status(
         self, sub_task_id: int, status: SubTaskStatus, error: str | None = None

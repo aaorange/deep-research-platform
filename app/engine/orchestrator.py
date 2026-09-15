@@ -8,6 +8,7 @@ import logging
 
 from app.db import ResearchTask, TaskStatus
 from app.db.base import SessionLocal
+from app.engine.budget import is_degraded
 from app.engine.checkpoint import open_graph_checkpointer, thread_id_for_task
 from app.engine.main_graph import DEFAULT_MAX_PAGES, OrchestratorDeps, build_main_graph
 from app.engine.persister import SubTaskPersister
@@ -94,6 +95,7 @@ async def execute_research(
             "report_id": final.get("report_id"),
             "report_chars": final.get("report_chars", 0),
             "citations": final.get("citations", 0),
+            "budget_degraded": is_degraded(task.token_used, task.token_budget),
             "token_used": task.token_used,
             "cost_cny": task.cost_cny,
         }

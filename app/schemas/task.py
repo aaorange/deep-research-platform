@@ -7,6 +7,12 @@ class TaskCreate(BaseModel):
     question: str = Field(min_length=2, max_length=200)
     background: str | None = Field(default=None, max_length=500)
     depth: str = Field(default="std", pattern="^(quick|std|deep)$")
+    token_budget: int | None = Field(
+        default=None,
+        ge=1000,
+        le=1_000_000,
+        description="token 预算覆盖（缺省用深度档位默认值）；消耗达 80% 触发降级",
+    )
 
 
 class TaskOut(BaseModel):

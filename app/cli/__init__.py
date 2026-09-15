@@ -115,6 +115,8 @@ async def run_full(question: str, background: str, depth: str, max_pages: int) -
             f"✓ 反思 {final['reflect_rounds']} 轮：补充 {final['supplemented']} 个子任务"
             "（缺口检测 + 追加指示）"
         )
+    if final.get("budget_degraded"):
+        print("⚠ 预算降级：已跳过剩余检索与补充轮，报告尾部含预算受限说明")
     if final["report_id"]:
         print(
             f"✓ 报告 #{final['report_id']}：{final['report_chars']} 字 / "

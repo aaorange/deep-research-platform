@@ -44,7 +44,8 @@ def main() -> int:
         print("TIMEOUT after 600s")
         return 1
 
-    print(f"final status={detail['status']}  token_used={detail['token_used']}  cost=¥{detail['cost_cny']:.4f}")
+    print(f"final status={detail['status']}  token_used={detail['token_used']}")
+    print(f"  cost=¥{detail['cost_cny']:.4f}")
     if detail["status"] != "done":
         print(f"error_msg={detail.get('error_msg')}")
         return 1
@@ -52,7 +53,11 @@ def main() -> int:
     rounds = {}
     for st in detail["sub_tasks"]:
         rounds.setdefault(st["round_no"], []).append(st)
-    print(f"sub_tasks: " + ", ".join(f"round{r}={len(v)}({sum(1 for s in v if s['status']=='done')}done)" for r, v in sorted(rounds.items())))
+    summary = ", ".join(
+        f"round{r}={len(v)}({sum(1 for s in v if s['status'] == 'done')}done)"
+        for r, v in sorted(rounds.items())
+    )
+    print(f"sub_tasks: {summary}")
 
     supplemented = detail["sub_tasks"] and any(st["round_no"] >= 2 for st in detail["sub_tasks"])
     consumed = detail.get("instructions") or []

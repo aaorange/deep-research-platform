@@ -31,7 +31,7 @@ class FakeRecorder:
 
 
 class FakeStore:
-    def __init__(self, instructions: list[dict] | None = None):
+    def __init__(self, instructions: list[dict] | None = None, token_budget: int = 0):
         self.rows: list[dict] = []
         self.created: list[dict] = []
         self.usage_calls: list[tuple] = []
@@ -39,6 +39,7 @@ class FakeStore:
         self.synthesis_notes: list[dict] = []  # synthesize/reflect 节点读到的笔记
         self.instructions: list[dict] = instructions or []  # 追加指示信箱
         self.consumed_rounds: list[int] = []
+        self.token_budget = token_budget  # 0 = 不限额（永不降级）
         self._next_id = 1
         self._next_report_id = 1
 
@@ -77,6 +78,18 @@ class FakeStore:
             for r in self.rows
             if r["status"] in ("pending", "running")
         ]
+
+    async def skip_pending_sub_tasks(self, task_id):
+        n = 0
+        for r in self.rows:
+            if r["status"] in ("pending", "running"):
+                r["status"] = "skipped"
+                n += 1
+        return n
+
+    async def task_budget_state(self, task_id):
+        used = sum(p + c for _, _, p, c in self.usage_calls)
+        return used, self.token_budget
 
     async def pending_instructions(self, task_id):
         return [i for i in self.instructions if i.get("consumed_round") is None]
@@ -158,8 +171,11 @@ def make_reflect(has_gaps=False, gap_titles=(), error=None, always=False):
     return reflect
 
 
-def make_worker(delay=0.0, fail_ids=frozenset(), store=None):
-    """worker 成功时把笔记写入 store.synthesis_notes 并置子任务行状态（模拟 DB 落库与状态机）。"""
+def make_worker(delay=0.0, fail_ids=frozenset(), store=None, usage=None):
+    """worker 成功时把笔记写入 store.synthesis_notes 并置子任务行状态（模拟 DB 落库与状态机）。
+
+    usage=(prompt, completion)：成功时模拟笔记 LLM 计费（预算降级用例用）。
+    """
     calls = []
 
     async def run_worker(task_id, sub_task, max_pages):
@@ -174,6 +190,8 @@ def make_worker(delay=0.0, fail_ids=frozenset(), store=None):
             if not error:
                 note = {"title": sub_task["title"], "content": "核心发现 [1]"}
                 store.synthesis_notes.append(note)
+            if usage and not error:
+                await store.add_usage(task_id, "deepseek-chat", usage[0], usage[1])
         return {
             "sub_task_id": sub_task["id"],
             "title": sub_task["title"],
@@ -306,26 +324,45 @@ async def test_full_flow_plan_execute_reflect_synthesize():
     assert store.reports[0]["token_total"] == 2300
 
     types = [e["type"] for e in recorder.events]
-    assert types == [EventType.plan, EventType.control, EventType.reflect, EventType.synthesize]
+    assert types == [
+        EventType.plan,
+        EventType.budget,
+        EventType.control,
+        EventType.budget,
+        EventType.reflect,
+        EventType.budget,
+        EventType.synthesize,
+        EventType.budget,
+    ]
     plan_ev = recorder.events[0]
     assert plan_ev["payload"]["count"] == 5
     assert plan_ev["payload"]["fallback"] is False
     assert plan_ev["tokens"] == 580
-    exec_ev = recorder.events[1]
+    exec_ev = recorder.events[2]
     assert exec_ev["payload"] == {"stage": "execute", "ran": 5, "ok": 5, "failed": 0}
-    ref_ev = recorder.events[2]
+    ref_ev = recorder.events[4]
     assert ref_ev["payload"]["has_gaps"] is False
     assert ref_ev["payload"]["created"] == 0
     assert ref_ev["tokens"] == 250
-    syn_ev = recorder.events[3]
+    syn_ev = recorder.events[6]
     assert syn_ev["payload"] == {
         "report_id": 1,
         "chars": final["report_chars"],
         "citations": 1,
         "notes": 5,
         "sources": 5,
+        "budget_degraded": False,
     }
     assert syn_ev["tokens"] == 2300
+    # budget 事件带配额对照（budget=0 不限额 → quota 0、不降级）
+    budget_ev = recorder.events[1]
+    assert budget_ev["payload"] == {
+        "stage": "plan",
+        "used": 580,
+        "budget": 0,
+        "quota": 0,
+        "degraded": False,
+    }
 
 
 async def test_synthesize_skips_when_no_notes():
@@ -523,6 +560,114 @@ async def test_synthesize_failure_raises_out_of_graph():
         await graph.ainvoke({"task_id": 1, "question": "q", "depth": "std"})
 
 
+async def test_reflect_degraded_skips_supplement_and_appends_disclaimer():
+    """预算 80% 降级：reflect 跳过评估与补充轮，报告尾部追加预算受限声明。"""
+    store = FakeStore(token_budget=3000)  # 80% = 2400
+    worker = make_worker(store=store, usage=(600, 200))  # plan 580 + 3×800 = 2980
+    reflect = make_reflect(always=True, gap_titles=["永远缺"])
+    recorder = FakeRecorder()
+    deps = make_deps(
+        plan=make_plan(make_outline(3)),
+        worker=worker,
+        reflect=reflect,
+        store=store,
+        recorder=recorder,
+    )
+
+    graph = build_main_graph(deps)
+    final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
+
+    assert len(worker.calls) == 3  # 首轮照常执行
+    assert reflect.calls == []  # 降级跳过评估
+    assert [r for r in store.created if r["round_no"] >= 2] == []  # 无补充子任务
+    assert final["supplemented"] == 0
+    assert final["report_id"] == 1
+    assert "预算受限说明" in store.reports[0]["markdown"]  # 声明在报告尾部
+    degrade = [e for e in recorder.events if e["type"] == EventType.degrade]
+    assert [d["payload"]["stage"] for d in degrade] == ["reflect"]
+    assert degrade[0]["payload"]["action"] == "skip_reflect_and_supplement"
+
+
+async def test_execute_entry_degraded_skips_pending():
+    """极小预算：plan 已耗 80%+，execute 入口直接跳过全部子任务（置 skipped）。"""
+    store = FakeStore(token_budget=700)  # plan 580 ≥ 560
+    worker = make_worker(store=store)
+    recorder = FakeRecorder()
+    deps = make_deps(plan=make_plan(make_outline(2)), worker=worker, store=store, recorder=recorder)
+
+    graph = build_main_graph(deps)
+    final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
+
+    assert worker.calls == []
+    assert all(r["status"] == "skipped" for r in store.rows)
+    assert final["executed"] == 0
+    assert final["report_id"] is None  # 无笔记 → 无报告
+    degrade = [e for e in recorder.events if e["type"] == EventType.degrade]
+    assert degrade[0]["payload"] == {"stage": "execute", "used": 580, "budget": 700, "skipped": 2}
+
+
+async def test_plan_skips_when_sub_tasks_exist_for_resume():
+    """resume：已有子任务时 plan 跳过（不重复规划/计费），execute 只续跑 pending。"""
+    store = FakeStore()
+    store.rows = [
+        {
+            "id": 1,
+            "task_id": 1,
+            "title": "已完成",
+            "keywords": None,
+            "status": "done",
+            "round_no": 1,
+        },
+        {
+            "id": 2,
+            "task_id": 1,
+            "title": "待续跑",
+            "keywords": None,
+            "status": "pending",
+            "round_no": 1,
+        },
+    ]
+    store._next_id = 3
+    store.synthesis_notes.append({"title": "已完成", "content": "已有笔记 [1]"})
+    plan = make_plan(make_outline(2))
+    worker = make_worker(store=store)
+    recorder = FakeRecorder()
+    deps = make_deps(plan=plan, worker=worker, store=store, recorder=recorder)
+
+    graph = build_main_graph(deps)
+    final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
+
+    assert plan.calls == []  # 不重新规划
+    assert store.created == []  # 不新建子任务
+    assert [c[1]["id"] for c in worker.calls] == [2]  # 只跑 pending
+    assert final["sub_task_count"] == 2
+    assert final["report_id"] == 1  # 历史笔记 + 续跑笔记综合
+    control = [e for e in recorder.events if e["type"] == EventType.control]
+    assert any("skip planning" in str(c["payload"]) for c in control)
+
+
+async def test_budget_events_recorded_per_stage():
+    """四个阶段各落一条 budget 事件（配额对照，看板数据源）。"""
+    store, recorder = FakeStore(), FakeRecorder()
+    deps = make_deps(store=store, recorder=recorder)
+
+    graph = build_main_graph(deps)
+    await graph.ainvoke({"task_id": 1, "question": "q", "depth": "std"})
+
+    budget_events = [e for e in recorder.events if e["type"] == EventType.budget]
+    assert [e["payload"]["stage"] for e in budget_events] == [
+        "plan",
+        "execute",
+        "reflect",
+        "synthesize",
+    ]
+    # 不限额（budget=0）永不降级
+    assert all(e["payload"]["degraded"] is False for e in budget_events)
+    assert all(
+        set(e["payload"]) == {"stage", "used", "budget", "quota", "degraded"} for e in budget_events
+    )
+
+
 async def test_plan_failure_falls_back_to_default_outline():
     store, recorder = FakeStore(), FakeRecorder()
     deps = make_deps(
@@ -608,7 +753,7 @@ async def test_worker_failure_isolated():
 
 
 async def test_execute_skips_completed_subtasks():
-    """resume 语义：done/failed 不重跑，崩溃残留 running 与 pending 重跑。"""
+    """resume 语义：已有子任务时 plan 跳过；done/failed 不重跑，running/pending 重跑。"""
     store = FakeStore()
     store.rows = [
         {
@@ -652,17 +797,20 @@ async def test_execute_skips_completed_subtasks():
             "round_no": 1,
         },
     ]
-    store._next_id = 6
     worker = make_worker(store=store)
-    deps = make_deps(plan=make_plan(make_outline(2)), worker=worker, store=store)
+    plan = make_plan(make_outline(2))
+    deps = make_deps(plan=plan, worker=worker, store=store)
 
     graph = build_main_graph(deps)
     final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
 
-    # 新建 2 + 历史 running/pending 2；done×2 与 failed×1 跳过
-    assert final["executed"] == 4
+    # plan 幂等：不重新规划、不新建子任务
+    assert plan.calls == []
+    assert store.created == []
+    # 历史 running/pending 2 个重跑；done×2 与 failed×1 跳过
+    assert final["executed"] == 2
     ran_ids = sorted(c[1]["id"] for c in worker.calls)
-    assert ran_ids == [4, 5, 6, 7]
+    assert ran_ids == [4, 5]
 
 
 async def test_zero_subtasks_routes_to_end():

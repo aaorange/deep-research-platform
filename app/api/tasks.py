@@ -30,7 +30,7 @@ async def create_task(
         background=body.background,
         depth=body.depth,
         status=TaskStatus.queued,
-        token_budget=DEPTH_BUDGETS[body.depth],
+        token_budget=body.token_budget or DEPTH_BUDGETS[body.depth],
     )
     session.add(task)
     await session.commit()
@@ -77,6 +77,7 @@ async def control_task(
     task_id: int,
     body: TaskControl,
     session: AsyncSession = Depends(get_session),
+    queue=Depends(get_queue),
 ) -> ResearchTask:
     task = await session.get(ResearchTask, task_id)
     if task is None:
@@ -84,11 +85,14 @@ async def control_task(
 
     transitions: dict[tuple[TaskStatus, str], TaskStatus] = {
         (TaskStatus.running, "pause"): TaskStatus.paused,
-        (TaskStatus.paused, "resume"): TaskStatus.running,
+        # resume → queued 并重新入队：worker 崩溃/被 kill 后残留的 running、
+        # paused、failed 均可续跑（子任务级幂等保证不重复消耗）
+        (TaskStatus.paused, "resume"): TaskStatus.queued,
+        (TaskStatus.running, "resume"): TaskStatus.queued,
+        (TaskStatus.failed, "resume"): TaskStatus.queued,
         (TaskStatus.queued, "stop"): TaskStatus.canceled,
         (TaskStatus.paused, "stop"): TaskStatus.stopped,
         (TaskStatus.running, "stop"): TaskStatus.stopped,
-        (TaskStatus.failed, "resume"): TaskStatus.running,
     }
     key = (task.status, body.action)
     if key not in transitions:
@@ -98,5 +102,7 @@ async def control_task(
         )
     task.status = transitions[key]
     await session.commit()
+    if body.action == "resume":
+        await enqueue_research(queue, task_id)
     await session.refresh(task)
     return task

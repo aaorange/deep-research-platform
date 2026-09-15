@@ -131,7 +131,7 @@ async def test_add_instruction(client: AsyncClient):
 
 
 async def test_control_transitions(client: AsyncClient):
-    c, _ = client
+    c, queue = client
     maker = async_sessionmaker(create_async_engine(TEST_DB_URL), expire_on_commit=False)
     async with maker() as session:
         task = ResearchTask(question="状态机测试", status=TaskStatus.running, token_budget=80000)
@@ -143,14 +143,61 @@ async def test_control_transitions(client: AsyncClient):
     assert resp.status_code == 200
     assert resp.json()["status"] == "paused"
 
+    # resume → queued 并重新入队（断点续跑）
     resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "resume"})
-    assert resp.json()["status"] == "running"
+    assert resp.json()["status"] == "queued"
+    assert queue.jobs == [("run_research_task", (task_id,))]
 
     resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "pause"})
-    assert resp.status_code == 200
+    assert resp.status_code == 409  # queued 不可暂停
 
     resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "stop"})
-    assert resp.json()["status"] == "stopped"
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "canceled"
 
+    # canceled 是用户终止的终态，resume 拒绝
     resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "resume"})
     assert resp.status_code == 409
+
+
+async def test_resume_requeues_from_crash_states(client: AsyncClient):
+    """failed / 残留 running（worker 被 kill）→ resume 重新入队续跑。"""
+    c, queue = client
+    maker = async_sessionmaker(create_async_engine(TEST_DB_URL), expire_on_commit=False)
+    for status in (TaskStatus.failed, TaskStatus.running):
+        async with maker() as session:
+            task = ResearchTask(question="续跑测试", status=status, token_budget=80000)
+            session.add(task)
+            await session.commit()
+            task_id = task.id
+
+        queue.jobs.clear()
+        resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "resume"})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "queued"
+        assert queue.jobs == [("run_research_task", (task_id,))]
+
+    # done 终态拒绝
+    async with maker() as session:
+        task = ResearchTask(question="已完成", status=TaskStatus.done, token_budget=80000)
+        session.add(task)
+        await session.commit()
+        done_id = task.id
+    resp = await c.post(f"/api/research/tasks/{done_id}/control", json={"action": "resume"})
+    assert resp.status_code == 409
+
+
+async def test_create_task_with_budget_override(client: AsyncClient):
+    c, _ = client
+    resp = await c.post(
+        "/api/research/tasks",
+        json={"question": "低压预算测试任务", "depth": "quick", "token_budget": 10000},
+    )
+    assert resp.status_code == 201
+    assert resp.json()["token_budget"] == 10_000
+
+    # 低于下限 422
+    resp = await c.post(
+        "/api/research/tasks", json={"question": "预算过小", "depth": "quick", "token_budget": 100}
+    )
+    assert resp.status_code == 422

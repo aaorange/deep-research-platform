@@ -173,3 +173,77 @@ async def test_running_sub_task_stays_pending_for_resume(session_maker):
         pending = await p.pending_sub_tasks(task_id)
 
     assert [r["title"] for r in pending] == ["甲"]
+
+
+async def test_pending_sub_tasks_heals_running_with_note(session_maker):
+    """自愈：running 且已落笔记（崩溃窗口）→ 置 done，resume 不重跑不重复落笔记。"""
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        p = SubTaskPersister(session)
+        created = await p.create_sub_tasks(task_id, [{"title": "甲", "keywords": None}])
+        await p.mark_sub_task_status(created[0]["id"], SubTaskStatus.running)
+        idx_to_id = await p.persist_sources(
+            task_id,
+            [
+                {
+                    "idx": 1,
+                    "url": "https://a.com/1",
+                    "title": "t",
+                    "domain": "a.com",
+                    "credibility": 3,
+                    "freshness": 0.5,
+                    "content_hash": "h1",
+                }
+            ],
+        )
+        await p.persist_note(task_id, created[0]["id"], {"summary": "已产出的笔记 [1]"}, idx_to_id)
+
+        pending = await p.pending_sub_tasks(task_id)
+        assert pending == []
+
+    async with session_maker() as session:
+        row = await session.get(SubTask, created[0]["id"])
+    assert row.status == SubTaskStatus.done
+
+
+async def test_skip_pending_sub_tasks(session_maker):
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        p = SubTaskPersister(session)
+        created = await p.create_sub_tasks(
+            task_id,
+            [
+                {"title": "待运行", "keywords": None},
+                {"title": "残留运行", "keywords": None},
+                {"title": "已完成", "keywords": None},
+            ],
+        )
+        await p.mark_sub_task_status(created[1]["id"], SubTaskStatus.running)
+        await p.mark_sub_task_status(created[2]["id"], SubTaskStatus.done)
+
+        skipped = await p.skip_pending_sub_tasks(task_id)
+        assert skipped == 2  # pending + running 都跳过，done 不动
+
+    async with session_maker() as session:
+        rows = list((await session.execute(select(SubTask).order_by(SubTask.id))).scalars().all())
+    assert [r.status for r in rows] == [
+        SubTaskStatus.skipped,
+        SubTaskStatus.skipped,
+        SubTaskStatus.done,
+    ]
+    assert rows[0].error_msg == "budget degraded"
+
+
+async def test_task_budget_state_reads_fresh_usage(session_maker):
+    """add_usage 后不 refresh 也能读到最新累计（列级 SELECT 绕开 identity map）。"""
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        task.token_budget = 30_000
+        await session.commit()
+
+        p = SubTaskPersister(session)
+        await p.add_usage(task_id, "deepseek-chat", 580, 20)
+        used, budget = await p.task_budget_state(task_id)
+
+    assert (used, budget) == (600, 30_000)

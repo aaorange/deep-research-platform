@@ -4,14 +4,20 @@ reflect 在每轮 execute 后对照 checklist 检测缺口：LLM 评估覆盖度
 指示信箱，产出补充轮子任务（round_no ≥ 2）后回到 execute；无缺口或到达
 补充轮上限（≤2）进入 synthesize。接口按四节点主图设计。
 
+预算控制（D11）：80% 降级在节点边界生效——execute 入口降级则跳过剩余
+子任务（置 skipped），reflect 降级则跳过补充轮（指示留在信箱待续跑消费），
+synthesize 照常出报告并附预算受限声明；各阶段落 budget 事件（配额对照），
+降级时刻落 degrade 事件。预算判定每次从 DB 新鲜读 token_used。
+
 并行策略：asyncio.gather 在 execute 节点内 fan-out，每个 worker 跑 W1 子图，
 结果由 merge_worker_results（"笔记 reducer"）合并——不走 LangGraph Send，
 规避并行分支的 reducer 语义坑（见执行方案第 6 章风险预案）。
 
-resume 语义：execute 每次进入从 store 读 pending 子任务，已完成/已失败的不重跑；
-崩溃残留的 running 状态视为待执行。reflect/synthesize 的输入一律从 DB 读
-（state 只作路由与展示），崩溃恢复或补充轮重入都能拿到全量历史产物。
-检查点由调用方（CLI/D9 worker）注入。
+resume 语义：plan 节点幂等（已有子任务即跳过重规划，避免续跑重复建任务）；
+execute 每次进入从 store 读 pending 子任务，已完成/已失败的不重跑，
+崩溃残留的 running 状态视为待执行（running 且已落笔记由 store 自愈为
+done）。reflect/synthesize 的输入一律从 DB 读（state 只作路由与展示），
+崩溃恢复或补充轮重入都能拿到全量历史产物。检查点由调用方注入。
 """
 
 import asyncio
@@ -23,6 +29,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.config import get_settings
 from app.db import EventType
+from app.engine.budget import budget_payload, disclaimer_md, is_degraded
 from app.engine.planner import DEPTH_SUBTASK_COUNT, PlanOutline, default_outline
 from app.engine.reflector import Reflection, instruction_to_sub_task
 
@@ -99,6 +106,10 @@ class SubTaskStoreProtocol(Protocol):
 
     async def pending_sub_tasks(self, task_id: int) -> list[dict]: ...
 
+    async def skip_pending_sub_tasks(self, task_id: int) -> int: ...
+
+    async def task_budget_state(self, task_id: int) -> tuple[int, int]: ...
+
     async def all_sub_tasks(self, task_id: int) -> list[dict]: ...
 
     async def pending_instructions(self, task_id: int) -> list[dict]: ...
@@ -172,6 +183,23 @@ def merge_worker_results(results: list[dict]) -> dict:
 def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
     async def plan_node(state: MainState) -> dict:
         task_id = state["task_id"]
+
+        # resume 幂等：子任务已落库（前次执行崩溃/被 kill）则跳过重规划，
+        # 避免续跑重复建任务重复计费
+        existing = await deps.store.all_sub_tasks(task_id)
+        if existing:
+            await deps.recorder.record(
+                task_id,
+                EventType.control,
+                {"stage": "plan", "info": "resume: sub tasks exist, skip planning"},
+            )
+            return {
+                "sub_tasks": existing,
+                "sub_task_count": len(existing),
+                "plan_fallback": False,
+                "plan_tokens": 0,
+            }
+
         fallback = False
         usage = None
         try:
@@ -212,6 +240,8 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
             },
             tokens=tokens or None,
         )
+        used, budget = await deps.store.task_budget_state(task_id)
+        await deps.recorder.record(task_id, EventType.budget, budget_payload("plan", used, budget))
         return {
             "sub_tasks": sub_tasks,
             "sub_task_count": len(sub_tasks),
@@ -222,6 +252,21 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
     async def execute_node(state: MainState) -> dict:
         task_id = state["task_id"]
         max_pages = state.get("max_pages", DEFAULT_MAX_PAGES)
+
+        # 预算降级：入口即超阈值则跳过剩余子任务（首轮极小预算或续跑超支）
+        used, budget = await deps.store.task_budget_state(task_id)
+        if is_degraded(used, budget):
+            skipped = await deps.store.skip_pending_sub_tasks(task_id)
+            await deps.recorder.record(
+                task_id,
+                EventType.degrade,
+                {"stage": "execute", "used": used, "budget": budget, "skipped": skipped},
+            )
+            await deps.recorder.record(
+                task_id, EventType.budget, budget_payload("execute", used, budget)
+            )
+            return {"executed": 0, "notes": [], "sources": [], "worker_errors": []}
+
         pending = await deps.store.pending_sub_tasks(task_id)
 
         if not pending:
@@ -251,6 +296,10 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
                 "failed": len(merged["worker_errors"]),
             },
         )
+        used, budget = await deps.store.task_budget_state(task_id)
+        await deps.recorder.record(
+            task_id, EventType.budget, budget_payload("execute", used, budget)
+        )
         return merged
 
     def after_plan(state: MainState) -> Literal["execute", "__end__"]:
@@ -262,6 +311,9 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
         输入一律从 DB 读（笔记/信源/子任务状态/信箱），补充轮重入与
         崩溃恢复后拿到的都是全量历史。LLM 失败不阻断主链路——记录后
         照常进入 synthesize（报告仍可基于现有材料产出）。
+
+        预算降级：跳过评估与补充轮，追加指示留在信箱（续跑调预算后可
+        再消费），直接进入 synthesize 并在报告尾部声明。
         """
         task_id = state["task_id"]
         rounds = state.get("reflect_rounds", 0)
@@ -271,6 +323,27 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
                 task_id, EventType.reflect, {"round": rounds, "skip": "max_rounds", "created": 0}
             )
             return {"need_more": False}
+
+        used, budget = await deps.store.task_budget_state(task_id)
+        if is_degraded(used, budget):
+            await deps.recorder.record(
+                task_id,
+                EventType.degrade,
+                {
+                    "stage": "reflect",
+                    "used": used,
+                    "budget": budget,
+                    "action": "skip_reflect_and_supplement",
+                },
+            )
+            await deps.recorder.record(
+                task_id, EventType.budget, budget_payload("reflect", used, budget)
+            )
+            return {
+                "need_more": False,
+                "supplemented": state.get("supplemented", 0),
+                "gap_history": state.get("gap_history", []),
+            }
 
         notes, sources = await deps.store.synthesis_inputs(task_id)
         sub_tasks = await deps.store.all_sub_tasks(task_id)
@@ -339,6 +412,10 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
             },
             tokens=usage.total_tokens if usage else None,
         )
+        used, budget = await deps.store.task_budget_state(task_id)
+        await deps.recorder.record(
+            task_id, EventType.budget, budget_payload("reflect", used, budget)
+        )
         return {
             "reflect_rounds": rounds + 1,
             "need_more": bool(created),
@@ -376,8 +453,12 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
         draft, usage = await deps.write_report(
             state["question"], state.get("background"), notes, sources
         )
+        # 预算降级：报告尾部追加声明（无引用锚点，不影响 citation_map）
+        used, budget = await deps.store.task_budget_state(task_id)
+        degraded = is_degraded(used, budget)
+        markdown = draft.markdown + (disclaimer_md(used, budget) if degraded else "")
         report_id = await deps.store.persist_report(
-            task_id, draft.markdown, draft.citation_map, usage.total_tokens if usage else 0
+            task_id, markdown, draft.citation_map, usage.total_tokens if usage else 0
         )
         if usage is not None:
             await deps.store.add_usage(
@@ -392,16 +473,21 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
             EventType.synthesize,
             {
                 "report_id": report_id,
-                "chars": len(draft.markdown),
+                "chars": len(markdown),
                 "citations": draft.n_citations,
                 "notes": len(notes),
                 "sources": len(sources),
+                "budget_degraded": degraded,
             },
             tokens=usage.total_tokens if usage else None,
         )
+        used, budget = await deps.store.task_budget_state(task_id)
+        await deps.recorder.record(
+            task_id, EventType.budget, budget_payload("synthesize", used, budget)
+        )
         return {
             "report_id": report_id,
-            "report_chars": len(draft.markdown),
+            "report_chars": len(markdown),
             "citations": draft.n_citations,
         }
 

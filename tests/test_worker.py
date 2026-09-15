@@ -15,6 +15,7 @@ from app.db import (
     AgentEvent,
     Base,
     EventType,
+    Note,
     Report,
     ResearchTask,
     SubTask,
@@ -46,10 +47,10 @@ async def session_maker():
     await engine.dispose()
 
 
-async def _make_task(maker, status=TaskStatus.queued) -> int:
+async def _make_task(maker, status=TaskStatus.queued, token_budget=80000) -> int:
     async with maker() as session:
         task = ResearchTask(
-            question="固态电池产业化进展", status=status, token_budget=80000, depth="std"
+            question="固态电池产业化进展", status=status, token_budget=token_budget, depth="std"
         )
         session.add(task)
         await session.commit()
@@ -73,12 +74,19 @@ def fake_report(markdown="# 报告\n\n结论 [1]。"):
     return write_report
 
 
-def make_fake_worker(maker, fail_all=False):
-    """模拟 runner：子任务状态回写 + 笔记/信源落测试库。"""
+def make_fake_worker(maker, fail_all=False, crash_ids=frozenset(), usage=None):
+    """模拟 runner：子任务状态回写 + 笔记/信源落测试库。
+
+    crash_ids 模拟进程被 kill：置 running 后直接抛异常，状态残留 running；
+    usage=(prompt, completion) 模拟笔记 LLM 计费（预算降级 e2e 用）。
+    """
 
     async def run_worker(task_id, sub_task, max_pages):
         async with maker() as session:
             p = SubTaskPersister(session)
+            await p.mark_sub_task_status(sub_task["id"], SubTaskStatus.running)
+            if sub_task["id"] in crash_ids:
+                raise RuntimeError(f"worker killed: {sub_task['title']}")
             if fail_all:
                 await p.mark_sub_task_status(sub_task["id"], SubTaskStatus.failed, "boom")
                 return {
@@ -107,6 +115,8 @@ def make_fake_worker(maker, fail_all=False):
             await p.persist_note(
                 task_id, sub_task["id"], {"summary": f"{sub_task['title']} 的发现 [1]"}, idx_to_id
             )
+            if usage:
+                await p.add_usage(task_id, "deepseek-chat", usage[0], usage[1])
             return {
                 "sub_task_id": sub_task["id"],
                 "title": sub_task["title"],
@@ -144,7 +154,7 @@ def fake_reflect(has_gaps=False):
     return reflect
 
 
-def patch_all(monkeypatch, maker, fail_all=False, reflect=None):
+def patch_all(monkeypatch, maker, fail_all=False, reflect=None, crash_ids=frozenset(), usage=None):
     outline = PlanOutline(
         sub_tasks=[PlanSubTask(title=f"子问题{i}", keywords=f"k{i}") for i in range(1, 4)]
     )
@@ -152,7 +162,7 @@ def patch_all(monkeypatch, maker, fail_all=False, reflect=None):
     monkeypatch.setattr(
         orchestrator,
         "make_sub_task_runner",
-        lambda verbose=False: make_fake_worker(maker, fail_all),
+        lambda verbose=False: make_fake_worker(maker, fail_all, crash_ids, usage),
     )
     monkeypatch.setattr(orchestrator, "write_report", fake_report())
     monkeypatch.setattr(orchestrator, "reflect_on_coverage", reflect or fake_reflect())
@@ -235,6 +245,87 @@ async def test_execute_research_consumes_instruction(session_maker, monkeypatch)
         consumed = events[0].payload
         assert consumed["instructions"] == 1
         assert consumed["next_round"] == 2
+
+
+async def test_execute_research_resume_after_crash(session_maker, monkeypatch):
+    """断点续跑 e2e：worker 中途被 kill（子任务残留 running）→ resume 续跑，
+    已完成子任务不重跑、笔记不重复、plan 不重复计费。"""
+    task_id = await _make_task(session_maker)
+    patch_all(monkeypatch, session_maker, crash_ids={2, 3})
+
+    # 第一轮：子任务 1 完成，2/3 崩溃 → gather 异常 → 任务 failed
+    with pytest.raises(RuntimeError, match="worker killed"):
+        await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        assert task.status == TaskStatus.failed
+        assert task.token_used == 580  # 只有 plan 计费
+
+    # resume：正常 worker 续跑（模拟重新入队后的第二次执行）
+    patch_all(monkeypatch, session_maker)
+    result = await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    assert result["status"] == "done"
+    assert result["notes"] == 3
+
+    async with session_maker() as session:
+        sub_tasks = list(
+            await session.scalars(
+                select(SubTask).where(SubTask.task_id == task_id).order_by(SubTask.id)
+            )
+        )
+        assert len(sub_tasks) == 3  # plan 幂等：无重复子任务
+        assert all(st.status == SubTaskStatus.done for st in sub_tasks)
+        notes = list(await session.scalars(select(Note).where(Note.task_id == task_id)))
+        assert len(notes) == 3  # 子任务 1 的笔记不重复
+        task = await session.get(ResearchTask, task_id)
+        # plan 只计费一次（resume 跳过重规划）：580 + reflect 250 + report 2300
+        assert task.token_used == 580 + 250 + 2300
+
+
+async def test_execute_research_budget_degrades(session_maker, monkeypatch):
+    """低压预算 e2e：execute 后消耗 80%+ → reflect 跳过 → 报告尾部预算声明。"""
+    task_id = await _make_task(session_maker, token_budget=2000)
+    patch_all(monkeypatch, session_maker, usage=(500, 100))  # 3×600 + plan 580 = 2380
+
+    async def no_reflect(*args, **kwargs):
+        raise AssertionError("degraded task must skip reflect")
+
+    monkeypatch.setattr(orchestrator, "reflect_on_coverage", no_reflect)
+
+    result = await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    assert result["status"] == "done"
+    assert result["budget_degraded"] is True
+    assert result["reflect_rounds"] == 0
+    assert result["supplemented"] == 0
+
+    async with session_maker() as session:
+        report = await session.get(Report, result["report_id"])
+        assert "预算受限说明" in report.markdown
+        assert report.markdown.endswith("覆盖度可能受限。\n")
+        events = list(
+            await session.scalars(
+                select(AgentEvent).where(
+                    AgentEvent.task_id == task_id, AgentEvent.type == EventType.degrade
+                )
+            )
+        )
+        assert [e.payload["stage"] for e in events] == ["reflect"]
+        budget_events = list(
+            await session.scalars(
+                select(AgentEvent).where(
+                    AgentEvent.task_id == task_id, AgentEvent.type == EventType.budget
+                )
+            )
+        )
+        assert [e.payload["stage"] for e in budget_events] == [
+            "plan",
+            "execute",
+            "reflect",
+            "synthesize",
+        ]
 
 
 async def test_execute_research_marks_failed_when_no_notes(session_maker, monkeypatch):
