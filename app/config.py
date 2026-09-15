@@ -20,6 +20,8 @@ class Settings(BaseSettings):
 
     bocha_api_key: str = ""
 
+    jina_api_key: str = ""  # 可选，配置后走更高配额通道
+
 
 @lru_cache
 def get_settings() -> Settings:
