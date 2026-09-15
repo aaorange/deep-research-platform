@@ -19,6 +19,9 @@ class PrintingRecorder(EventRecorder):
         EventType.fetch: "📄",
         EventType.degrade: "⚠️ ",
         EventType.note: "📝",
+        EventType.reflect: "🔍",
+        EventType.budget: "💰",
+        EventType.synthesize: "📊",
         EventType.control: "⛔",
     }
 
@@ -64,4 +67,9 @@ class PrintingRecorder(EventRecorder):
                     f" / 失败 {payload.get('failed')}"
                 )
             return f"控制事件：{payload.get('stage')} {payload.get('error') or payload.get('info')}"
+        if type == EventType.synthesize:
+            return (
+                f"报告生成 #{payload.get('report_id')}：{payload.get('chars')} 字 / "
+                f"{payload.get('citations')} 个引用 / 基于 {payload.get('notes')} 份笔记"
+            )
         return str(payload)[:60]

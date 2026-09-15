@@ -1,14 +1,24 @@
-"""子图结果落库：sources、notes、task token 累计与成本折算。
+"""子图结果落库：sources、notes、reports、task 状态与 token 累计成本折算。
 
 DeepSeek 官方定价（2025，缓存未命中）：
   deepseek-chat      输入 ¥2/M tokens   输出 ¥8/M tokens
   deepseek-reasoner  输入 ¥4/M tokens   输出 ¥16/M tokens
 """
 
+from datetime import UTC, datetime
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import Note, ResearchTask, Source, SubTask, SubTaskStatus
+from app.db import (
+    Note,
+    Report,
+    ResearchTask,
+    Source,
+    SubTask,
+    SubTaskStatus,
+    TaskStatus,
+)
 
 PRICE_PER_M = {
     "deepseek-chat": (2.0, 8.0),
@@ -118,3 +128,83 @@ class SubTaskPersister:
             select(Source).where(Source.task_id == task_id).order_by(Source.id)
         )
         return list(result.scalars().all())
+
+    async def synthesis_inputs(self, task_id: int) -> tuple[list[dict], list[dict]]:
+        """报告综合输入：全部笔记（带子任务标题）+ 全部信源，均按落库顺序。
+
+        笔记 content 的 [N] 锚点已是信源库 id（persist_note 重写过）。
+        """
+        note_rows = (
+            await self.session.execute(
+                select(Note, SubTask.title)
+                .outerjoin(SubTask, Note.sub_task_id == SubTask.id)
+                .where(Note.task_id == task_id)
+                .order_by(Note.id)
+            )
+        ).all()
+        notes = [
+            {
+                "sub_task_id": n.sub_task_id,
+                "title": title or "未归类笔记",
+                "content": n.content,
+            }
+            for n, title in note_rows
+        ]
+        src_rows = (
+            (
+                await self.session.execute(
+                    select(Source).where(Source.task_id == task_id).order_by(Source.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        sources = [
+            {
+                "id": s.id,
+                "url": s.url,
+                "title": s.title,
+                "domain": s.domain,
+                "credibility": s.credibility,
+            }
+            for s in src_rows
+        ]
+        return notes, sources
+
+    async def persist_report(
+        self, task_id: int, markdown: str, citation_map: dict[int, int], token_total: int
+    ) -> int:
+        row = Report(
+            task_id=task_id,
+            version=1,
+            markdown=markdown,
+            citation_map={str(n): sid for n, sid in citation_map.items()},
+            token_total=token_total,
+        )
+        self.session.add(row)
+        await self.session.commit()
+        return row.id
+
+    async def mark_task_running(self, task_id: int, thread_id: str | None = None) -> None:
+        await self.session.execute(
+            update(ResearchTask)
+            .where(ResearchTask.id == task_id)
+            .values(
+                status=TaskStatus.running,
+                error_msg=None,
+                thread_id=ResearchTask.thread_id if thread_id is None else thread_id,
+            )
+        )
+        await self.session.commit()
+
+    async def finish_task(self, task_id: int, done: bool, error: str | None = None) -> None:
+        await self.session.execute(
+            update(ResearchTask)
+            .where(ResearchTask.id == task_id)
+            .values(
+                status=TaskStatus.done if done else TaskStatus.failed,
+                error_msg=error,
+                finished_at=datetime.now(UTC),
+            )
+        )
+        await self.session.commit()

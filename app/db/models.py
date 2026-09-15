@@ -148,6 +148,9 @@ class Report(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     markdown: Mapped[str] = mapped_column(Text)
     chart_specs: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    citation_map: Mapped[dict | None] = mapped_column(
+        JSONB, default=None, comment="展示编号 → 信源 id，报告阅读页渲染信源卡"
+    )
     token_total: Mapped[int] = mapped_column(Integer, default=0)
 
     task: Mapped[ResearchTask] = relationship(back_populates="reports")

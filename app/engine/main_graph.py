@@ -47,6 +47,11 @@ class MainState(TypedDict, total=False):
     sources: list[dict]
     worker_errors: list[dict]
 
+    # synthesize 节点输出
+    report_id: int | None
+    report_chars: int
+    citations: int
+
 
 class PlanFn(Protocol):
     async def __call__(
@@ -58,10 +63,22 @@ class WorkerRunner(Protocol):
     async def __call__(self, task_id: int, sub_task: dict, max_pages: int) -> dict: ...
 
 
+class ReportFn(Protocol):
+    async def __call__(
+        self, question: str, background: str | None, notes: list[dict], sources: list[dict]
+    ) -> tuple[object, object | None]: ...
+
+
 class SubTaskStoreProtocol(Protocol):
     async def create_sub_tasks(self, task_id: int, sub_tasks: list[dict]) -> list[dict]: ...
 
     async def pending_sub_tasks(self, task_id: int) -> list[dict]: ...
+
+    async def synthesis_inputs(self, task_id: int) -> tuple[list[dict], list[dict]]: ...
+
+    async def persist_report(
+        self, task_id: int, markdown: str, citation_map: dict[int, int], token_total: int
+    ) -> int: ...
 
     async def add_usage(
         self, task_id: int, model: str, prompt_tokens: int, completion_tokens: int
@@ -85,6 +102,7 @@ class RecorderProtocol(Protocol):
 class OrchestratorDeps:
     write_plan: PlanFn
     run_worker: WorkerRunner
+    write_report: ReportFn
     recorder: RecorderProtocol
     store: SubTaskStoreProtocol
     max_parallel: int = DEFAULT_MAX_PARALLEL
@@ -206,10 +224,57 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
     def after_plan(state: MainState) -> Literal["execute", "__end__"]:
         return "execute" if state.get("sub_tasks") else "__end__"
 
+    async def synthesize_node(state: MainState) -> dict:
+        task_id = state["task_id"]
+        # 从 DB 读全量笔记/信源（非 state）：resume 后续跑也拿得到历史轮产物
+        notes, sources = await deps.store.synthesis_inputs(task_id)
+
+        if not notes:
+            await deps.recorder.record(
+                task_id,
+                EventType.control,
+                {"stage": "synthesize", "info": "no notes, skip report"},
+            )
+            return {"report_id": None, "report_chars": 0, "citations": 0}
+
+        draft, usage = await deps.write_report(
+            state["question"], state.get("background"), notes, sources
+        )
+        report_id = await deps.store.persist_report(
+            task_id, draft.markdown, draft.citation_map, usage.total_tokens if usage else 0
+        )
+        if usage is not None:
+            await deps.store.add_usage(
+                task_id,
+                get_settings().llm_model_reasoner,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+            )
+
+        await deps.recorder.record(
+            task_id,
+            EventType.synthesize,
+            {
+                "report_id": report_id,
+                "chars": len(draft.markdown),
+                "citations": draft.n_citations,
+                "notes": len(notes),
+                "sources": len(sources),
+            },
+            tokens=usage.total_tokens if usage else None,
+        )
+        return {
+            "report_id": report_id,
+            "report_chars": len(draft.markdown),
+            "citations": draft.n_citations,
+        }
+
     graph = StateGraph(MainState)
     graph.add_node("plan", plan_node)
     graph.add_node("execute", execute_node)
+    graph.add_node("synthesize", synthesize_node)
     graph.add_edge(START, "plan")
     graph.add_conditional_edges("plan", after_plan)
-    graph.add_edge("execute", END)
+    graph.add_edge("execute", "synthesize")
+    graph.add_edge("synthesize", END)
     return graph.compile(checkpointer=checkpointer)

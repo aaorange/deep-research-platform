@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db import ResearchTask, TaskStatus
 from app.db.base import get_session
 from app.engine.planner import DEPTH_BUDGETS
+from app.queue import enqueue_research, get_queue
 from app.schemas.task import TaskControl, TaskCreate, TaskDetail, TaskOut
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
@@ -12,7 +13,9 @@ router = APIRouter(prefix="/research/tasks", tags=["research"])
 
 @router.post("", response_model=TaskOut, status_code=201)
 async def create_task(
-    body: TaskCreate, session: AsyncSession = Depends(get_session)
+    body: TaskCreate,
+    session: AsyncSession = Depends(get_session),
+    queue=Depends(get_queue),
 ) -> ResearchTask:
     task = ResearchTask(
         question=body.question,
@@ -24,6 +27,7 @@ async def create_task(
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    await enqueue_research(queue, task.id)
     return task
 
 

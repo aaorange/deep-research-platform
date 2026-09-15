@@ -2,6 +2,8 @@ import asyncio
 import time
 from types import SimpleNamespace
 
+import pytest
+
 from app.config import get_settings
 from app.db import EventType
 from app.engine.main_graph import (
@@ -32,7 +34,10 @@ class FakeStore:
         self.rows: list[dict] = []
         self.created: list[dict] = []
         self.usage_calls: list[tuple] = []
+        self.reports: list[dict] = []
+        self.synthesis_notes: list[dict] = []  # synthesize 节点读到的笔记
         self._next_id = 1
+        self._next_report_id = 1
 
     async def create_sub_tasks(self, task_id, sub_tasks):
         out = []
@@ -57,6 +62,33 @@ class FakeStore:
             if r["status"] in ("pending", "running")
         ]
 
+    async def synthesis_inputs(self, task_id):
+        sources = [
+            {
+                "id": 100 + i,
+                "url": f"https://s.com/{i}",
+                "title": "s",
+                "domain": "s.com",
+                "credibility": 3,
+            }
+            for i in range(len(self.synthesis_notes))
+        ]
+        return self.synthesis_notes, sources
+
+    async def persist_report(self, task_id, markdown, citation_map, token_total):
+        report_id = self._next_report_id
+        self._next_report_id += 1
+        self.reports.append(
+            {
+                "id": report_id,
+                "task_id": task_id,
+                "markdown": markdown,
+                "citation_map": citation_map,
+                "token_total": token_total,
+            }
+        )
+        return report_id
+
     async def add_usage(self, task_id, model, prompt_tokens, completion_tokens):
         self.usage_calls.append((task_id, model, prompt_tokens, completion_tokens))
 
@@ -80,7 +112,8 @@ def make_outline(n):
     )
 
 
-def make_worker(delay=0.0, fail_ids=frozenset()):
+def make_worker(delay=0.0, fail_ids=frozenset(), store=None):
+    """worker 成功时把笔记写入 store.synthesis_notes（模拟真实路径的 DB 落库）。"""
     calls = []
 
     async def run_worker(task_id, sub_task, max_pages):
@@ -88,6 +121,8 @@ def make_worker(delay=0.0, fail_ids=frozenset()):
         if delay:
             await asyncio.sleep(delay)
         error = "boom" if sub_task["id"] in fail_ids else None
+        if not error and store is not None:
+            store.synthesis_notes.append({"title": sub_task["title"], "content": "核心发现 [1]"})
         return {
             "sub_task_id": sub_task["id"],
             "title": sub_task["title"],
@@ -104,12 +139,30 @@ def make_worker(delay=0.0, fail_ids=frozenset()):
     return run_worker
 
 
-def make_deps(plan=None, worker=None, store=None, recorder=None, **kwargs):
+def make_report(error=None):
+    calls = []
+
+    async def write_report(question, background, notes, sources):
+        calls.append((question, background, len(notes), len(sources)))
+        if error:
+            raise error
+        draft = SimpleNamespace(
+            markdown=f"# {question}\n\n结论 [1]。", citation_map={1: 101}, n_citations=1
+        )
+        return draft, SimpleNamespace(prompt_tokens=800, completion_tokens=1500, total_tokens=2300)
+
+    write_report.calls = calls
+    return write_report
+
+
+def make_deps(plan=None, worker=None, report=None, store=None, recorder=None, **kwargs):
+    store = store or FakeStore()
     return OrchestratorDeps(
         write_plan=plan or make_plan(make_outline(5)),
-        run_worker=worker or make_worker(),
+        run_worker=worker or make_worker(store=store),
+        write_report=report or make_report(),
         recorder=recorder or FakeRecorder(),
-        store=store or FakeStore(),
+        store=store,
         **kwargs,
     )
 
@@ -141,10 +194,12 @@ def test_merge_worker_results_keeps_everything():
     assert merged["worker_errors"] == [{"sub_task_id": 9, "title": "t9", "error": "search failed"}]
 
 
-async def test_full_flow_plan_then_execute():
+async def test_full_flow_plan_execute_synthesize():
     store, recorder = FakeStore(), FakeRecorder()
-    worker = make_worker()
-    deps = make_deps(make_plan(make_outline(5)), worker, store, recorder)
+    plan = make_plan(make_outline(5))
+    worker = make_worker(store=store)
+    report = make_report()
+    deps = make_deps(plan=plan, worker=worker, report=report, store=store, recorder=recorder)
 
     graph = build_main_graph(deps)
     final = await graph.ainvoke(
@@ -160,27 +215,82 @@ async def test_full_flow_plan_then_execute():
     assert final["worker_errors"] == []
 
     assert len(store.created) == 5
-    assert store.usage_calls == [(1, get_settings().llm_model_chat, 500, 80)]
+    # plan（chat）+ 报告（reasoner）两笔计费
+    assert store.usage_calls == [
+        (1, get_settings().llm_model_chat, 500, 80),
+        (1, get_settings().llm_model_reasoner, 800, 1500),
+    ]
 
     # worker 拿到落库后的 id 与 max_pages
     assert [c[1]["id"] for c in worker.calls] == [1, 2, 3, 4, 5]
     assert all(c[2] == 7 for c in worker.calls)
     assert all(c[1]["keywords"] == f"关键词{i}" for i, c in enumerate(worker.calls, 1))
 
+    # synthesize：从 store 读到 5 份笔记，报告落库并回填 state
+    assert report.calls == [("问题", "背景", 5, 5)]
+    assert final["report_id"] == 1
+    assert final["report_chars"] > 0
+    assert final["citations"] == 1
+    assert store.reports[0]["markdown"] == "# 问题\n\n结论 [1]。"
+    assert store.reports[0]["citation_map"] == {1: 101}
+    assert store.reports[0]["token_total"] == 2300
+
     types = [e["type"] for e in recorder.events]
-    assert types == [EventType.plan, EventType.control]
+    assert types == [EventType.plan, EventType.control, EventType.synthesize]
     plan_ev = recorder.events[0]
     assert plan_ev["payload"]["count"] == 5
     assert plan_ev["payload"]["fallback"] is False
     assert plan_ev["tokens"] == 580
     exec_ev = recorder.events[1]
     assert exec_ev["payload"] == {"stage": "execute", "ran": 5, "ok": 5, "failed": 0}
+    syn_ev = recorder.events[2]
+    assert syn_ev["payload"] == {
+        "report_id": 1,
+        "chars": final["report_chars"],
+        "citations": 1,
+        "notes": 5,
+        "sources": 5,
+    }
+    assert syn_ev["tokens"] == 2300
+
+
+async def test_synthesize_skips_when_no_notes():
+    """全部 worker 失败 → DB 无笔记 → 不生成报告，图正常结束。"""
+    store, recorder = FakeStore(), FakeRecorder()
+    deps = make_deps(
+        plan=make_plan(make_outline(3)),
+        worker=make_worker(fail_ids={1, 2, 3}),
+        report=make_report(),
+        store=store,
+        recorder=recorder,
+    )
+
+    graph = build_main_graph(deps)
+    final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
+
+    assert final["report_id"] is None
+    assert store.reports == []
+    types = [e["type"] for e in recorder.events]
+    assert types[-1] == EventType.control
+    assert recorder.events[-1]["payload"]["stage"] == "synthesize"
+
+
+async def test_synthesize_failure_raises_out_of_graph():
+    deps = make_deps(report=make_report(error=RuntimeError("reasoner 503")))
+
+    graph = build_main_graph(deps)
+    with pytest.raises(RuntimeError, match="reasoner 503"):
+        await graph.ainvoke({"task_id": 1, "question": "q", "depth": "std"})
 
 
 async def test_plan_failure_falls_back_to_default_outline():
     store, recorder = FakeStore(), FakeRecorder()
-    worker = make_worker()
-    deps = make_deps(make_plan(error=RuntimeError("deepseek 503")), worker, store, recorder)
+    deps = make_deps(
+        plan=make_plan(error=RuntimeError("deepseek 503")),
+        worker=make_worker(store=store),
+        store=store,
+        recorder=recorder,
+    )
 
     graph = build_main_graph(deps)
     final = await graph.ainvoke({"task_id": 1, "question": "AI 芯片竞争格局", "depth": "std"})
@@ -189,7 +299,8 @@ async def test_plan_failure_falls_back_to_default_outline():
     assert final["sub_task_count"] == 5
     titles = [st["title"] for st in final["sub_tasks"]]
     assert "AI 芯片竞争格局的发展现状与整体规模" in titles
-    assert store.usage_calls == []  # 兜底路径不产生 LLM 计费
+    # 兜底路径不产生 plan 阶段 LLM 计费（reasoner 报告计费另算）
+    assert all(u[1] != get_settings().llm_model_chat for u in store.usage_calls)
 
     control = recorder.events[0]
     assert control["type"] == EventType.control
@@ -264,8 +375,8 @@ async def test_execute_skips_completed_subtasks():
         {"id": 5, "task_id": 1, "title": "待运行", "keywords": None, "status": "pending"},
     ]
     store._next_id = 6
-    worker = make_worker()
-    deps = make_deps(make_plan(make_outline(2)), worker, store)
+    worker = make_worker(store=store)
+    deps = make_deps(plan=make_plan(make_outline(2)), worker=worker, store=store)
 
     graph = build_main_graph(deps)
     final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
