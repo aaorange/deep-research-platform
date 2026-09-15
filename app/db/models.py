@@ -62,6 +62,7 @@ class ResearchTask(Base):
     token_budget: Mapped[int] = mapped_column(Integer, default=0)
     token_used: Mapped[int] = mapped_column(Integer, default=0)
     cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
+    event_seq: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error_msg: Mapped[str | None] = mapped_column(Text, default=None)
     created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[DateTime] = mapped_column(

@@ -12,6 +12,7 @@ dependencies = [
     "alembic>=1.13",
     "redis>=5.0",
     "httpx>=0.27",
+    "ddgs>=9.16.0",
 ]
 
 [dependency-groups]
