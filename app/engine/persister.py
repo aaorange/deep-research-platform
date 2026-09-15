@@ -8,7 +8,7 @@ DeepSeek 官方定价（2025，缓存未命中）：
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import Note, ResearchTask, Source
+from app.db import Note, ResearchTask, Source, SubTask, SubTaskStatus
 
 PRICE_PER_M = {
     "deepseek-chat": (2.0, 8.0),
@@ -27,6 +27,38 @@ def cost_cny(model: str, prompt_tokens: int, completion_tokens: int) -> float:
 class SubTaskPersister:
     def __init__(self, session: AsyncSession):
         self.session = session
+
+    async def create_sub_tasks(self, task_id: int, sub_tasks: list[dict]) -> list[dict]:
+        """大纲落库 sub_tasks 表，返回含 id 的行（保持传入顺序）。"""
+        rows = [
+            SubTask(task_id=task_id, title=s["title"], keywords=s.get("keywords"))
+            for s in sub_tasks
+        ]
+        self.session.add_all(rows)
+        await self.session.commit()
+        return [{"id": r.id, "title": r.title, "keywords": r.keywords} for r in rows]
+
+    async def pending_sub_tasks(self, task_id: int) -> list[dict]:
+        """待执行子任务：pending + 崩溃残留的 running（resume 时重跑）。"""
+        result = await self.session.execute(
+            select(SubTask)
+            .where(
+                SubTask.task_id == task_id,
+                SubTask.status.in_([SubTaskStatus.pending, SubTaskStatus.running]),
+            )
+            .order_by(SubTask.id)
+        )
+        return [
+            {"id": r.id, "title": r.title, "keywords": r.keywords} for r in result.scalars().all()
+        ]
+
+    async def mark_sub_task_status(
+        self, sub_task_id: int, status: SubTaskStatus, error: str | None = None
+    ) -> None:
+        await self.session.execute(
+            update(SubTask).where(SubTask.id == sub_task_id).values(status=status, error_msg=error)
+        )
+        await self.session.commit()
 
     async def persist_sources(self, task_id: int, sources: list[dict]) -> dict[int, int]:
         """写入 sources 表，返回 {subgraph_idx: db_id}。"""

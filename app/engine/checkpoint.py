@@ -4,6 +4,10 @@
 从最近的 checkpoint 恢复，已完成节点不重跑。
 """
 
+import sys
+from contextlib import nullcontext
+
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from app.config import get_settings
@@ -22,3 +26,15 @@ def _psycopg_url(asyncpg_url: str) -> str:
 def open_checkpointer() -> AsyncPostgresSaver:
     """返回 async with 用的上下文管理器，进入时自动建表。"""
     return AsyncPostgresSaver.from_conn_string(_psycopg_url(get_settings().database_url))
+
+
+def open_graph_checkpointer():
+    """CLI/主图用检查点。
+
+    Windows 开发机降级为内存检查点：psycopg 需要 SelectorEventLoop，而
+    crawl4ai/playwright 需要 Proactor（subprocess），二者在 Windows 互斥；
+    Postgres 检查点只在 Linux（部署环境）启用。
+    """
+    if sys.platform == "win32":
+        return nullcontext(InMemorySaver())
+    return open_checkpointer()

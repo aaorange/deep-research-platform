@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.db import Base, Note, ResearchTask, Source, SubTask, TaskStatus
+from app.db import Base, Note, ResearchTask, Source, SubTask, SubTaskStatus, TaskStatus
 from app.engine.persister import SubTaskPersister, cost_cny
 
 TEST_DB_URL = "postgresql+asyncpg://research:research@localhost:5432/research_test"
@@ -130,3 +130,46 @@ async def test_add_usage_accumulates(session_maker):
         task = await session.get(ResearchTask, task_id)
     assert task.token_used == 6000
     assert abs(task.cost_cny - (5000 * 2 + 1000 * 8) / 1_000_000) < 1e-6
+
+
+async def test_create_and_pending_sub_tasks(session_maker):
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        p = SubTaskPersister(session)
+        created = await p.create_sub_tasks(
+            task_id,
+            [
+                {"title": "医疗大模型现状", "keywords": "医疗 大模型 现状"},
+                {"title": "落地案例", "keywords": None},
+            ],
+        )
+
+    assert [c["title"] for c in created] == ["医疗大模型现状", "落地案例"]
+    assert created[0]["id"] != created[1]["id"]
+
+    async with session_maker() as session:
+        p = SubTaskPersister(session)
+        pending = await p.pending_sub_tasks(task_id)
+        assert [r["title"] for r in pending] == ["医疗大模型现状", "落地案例"]
+
+        await p.mark_sub_task_status(created[0]["id"], SubTaskStatus.done)
+        await p.mark_sub_task_status(created[1]["id"], SubTaskStatus.failed, "all reads failed")
+        assert await p.pending_sub_tasks(task_id) == []
+
+    async with session_maker() as session:
+        rows = list((await session.execute(select(SubTask).order_by(SubTask.id))).scalars().all())
+    assert [r.status for r in rows] == [SubTaskStatus.done, SubTaskStatus.failed]
+    assert rows[1].error_msg == "all reads failed"
+
+
+async def test_running_sub_task_stays_pending_for_resume(session_maker):
+    """崩溃残留的 running 状态仍在 pending 里 → resume 时重跑。"""
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        p = SubTaskPersister(session)
+        created = await p.create_sub_tasks(task_id, [{"title": "甲", "keywords": None}])
+        await p.mark_sub_task_status(created[0]["id"], SubTaskStatus.running)
+
+        pending = await p.pending_sub_tasks(task_id)
+
+    assert [r["title"] for r in pending] == ["甲"]

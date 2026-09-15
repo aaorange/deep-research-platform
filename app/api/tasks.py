@@ -4,11 +4,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import ResearchTask, TaskStatus
 from app.db.base import get_session
+from app.engine.planner import DEPTH_BUDGETS
 from app.schemas.task import TaskControl, TaskCreate, TaskDetail, TaskOut
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
-
-DEPTH_BUDGETS = {"quick": 30_000, "std": 80_000, "deep": 150_000}
 
 
 @router.post("", response_model=TaskOut, status_code=201)
