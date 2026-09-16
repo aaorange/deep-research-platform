@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple 
     "fastapi>=0.115" "uvicorn[standard]>=0.30" "pydantic-settings>=2.4" \
     "sqlalchemy[asyncio]>=2.0" "asyncpg>=0.29" "alembic>=1.13" "redis>=5.0" \
     "httpx>=0.27" "ddgs>=9.16.0" "crawl4ai>=0.9.3" "trafilatura>=2.2.0" \
-    "langgraph>=1.0" "langgraph-checkpoint-postgres>=2.0" "instructor>=1.17" \
+    "langgraph>=1.0" "langgraph-checkpoint-postgres>=2.0" "psycopg[binary,pool]>=3.2" "instructor>=1.17" \
     "openai>=2.0,<3.0" "arq>=0.26" "playwright>=1.62.0" "markdown>=3.10.3"
 
 # crawl4ai 渲染层：本地 Chromium（npmmirror 加速浏览器下载）
