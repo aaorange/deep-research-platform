@@ -22,6 +22,8 @@ class Settings(BaseSettings):
 
     jina_api_key: str = ""  # 可选，配置后走更高配额通道
 
+    sse_heartbeat_s: float = 10.0  # SSE 心跳与终态轮询周期
+
 
 @lru_cache
 def get_settings() -> Settings:

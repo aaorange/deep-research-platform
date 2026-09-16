@@ -63,5 +63,19 @@ class InstructionOut(BaseModel):
     consumed_round: int | None = None
 
 
+class EventOut(BaseModel):
+    id: int
+    seq: int
+    task_id: int
+    sub_task_id: int | None
+    type: str
+    payload: dict
+    tokens: int | None
+    latency_ms: int | None
+    created_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
 def now_utc() -> datetime:
     return datetime.now(UTC)

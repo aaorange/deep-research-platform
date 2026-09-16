@@ -1,13 +1,18 @@
-from fastapi import APIRouter, Depends, HTTPException
+import asyncio
+import json
+
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import ResearchTask, TaskStatus
+from app.db import AgentEvent, ResearchTask, TaskStatus
 from app.db.base import get_session
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import DEPTH_BUDGETS
 from app.queue import enqueue_research, get_queue
 from app.schemas.task import (
+    EventOut,
     InstructionCreate,
     InstructionOut,
     TaskControl,
@@ -15,8 +20,41 @@ from app.schemas.task import (
     TaskDetail,
     TaskOut,
 )
+from app.services import event_bus
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
+
+TERMINAL_STATUSES = (TaskStatus.done, TaskStatus.failed, TaskStatus.canceled, TaskStatus.stopped)
+
+
+async def _events_after(session: AsyncSession, task_id: int, after_seq: int) -> list[AgentEvent]:
+    result = await session.execute(
+        select(AgentEvent)
+        .where(AgentEvent.task_id == task_id, AgentEvent.seq > after_seq)
+        .order_by(AgentEvent.seq)
+    )
+    return list(result.scalars().all())
+
+
+async def _task_status(session: AsyncSession, task_id: int) -> TaskStatus | None:
+    result = await session.execute(select(ResearchTask.status).where(ResearchTask.id == task_id))
+    return result.scalar_one_or_none()
+
+
+def _sse_event(event: AgentEvent | dict) -> str:
+    if isinstance(event, AgentEvent):
+        event = {
+            "seq": event.seq,
+            "task_id": event.task_id,
+            "sub_task_id": event.sub_task_id,
+            "type": str(event.type),
+            "payload": event.payload or {},
+            "tokens": event.tokens,
+            "latency_ms": event.latency_ms,
+            "created_at": event.created_at.isoformat() if event.created_at else None,
+        }
+    data = json.dumps(event, ensure_ascii=False)
+    return f"id: {event['seq']}\nevent: {event['type']}\ndata: {data}\n\n"
 
 
 @router.post("", response_model=TaskOut, status_code=201)
@@ -106,3 +144,111 @@ async def control_task(
         await enqueue_research(queue, task_id)
     await session.refresh(task)
     return task
+
+
+@router.get("/{task_id}/events", response_model=list[EventOut])
+async def list_events(
+    task_id: int,
+    after_seq: int = Query(default=0, ge=0),
+    limit: int = Query(default=500, ge=1, le=2000),
+    session: AsyncSession = Depends(get_session),
+) -> list[AgentEvent]:
+    """序号回放（JSON）：返回 seq > after_seq 的事件，供轮询或 SSE 断连后批量补拉。"""
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    result = await session.execute(
+        select(AgentEvent)
+        .where(AgentEvent.task_id == task_id, AgentEvent.seq > after_seq)
+        .order_by(AgentEvent.seq)
+        .limit(limit)
+    )
+    return list(result.scalars().all())
+
+
+@router.get("/{task_id}/events/stream")
+async def stream_events(
+    task_id: int,
+    request: Request,
+    after_seq: int | None = Query(default=None, ge=0),
+    session: AsyncSession = Depends(get_session),
+) -> StreamingResponse:
+    """SSE 事件流：连接即回放 seq > after_seq 的历史，再实时转发 pub/sub 新事件。
+
+    断线重连：EventSource 自动携带 Last-Event-ID 请求头（即上次收到的最大 seq），
+    亦可显式传 after_seq 查询参数；两条通道按 seq 去重，界面不丢动作。
+    Redis 不可用时自动退化为心跳周期 DB 轮询，流不中断。
+    """
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+
+    last_event_id = request.headers.get("last-event-id")
+    if after_seq is not None:
+        start_after = after_seq
+    elif last_event_id:
+        try:
+            start_after = int(last_event_id)
+        except ValueError:
+            start_after = 0
+    else:
+        start_after = 0
+
+    return StreamingResponse(
+        _sse_generator(task_id, start_after, session),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _sse_generator(task_id: int, start_after: int, session: AsyncSession):
+    from app.config import get_settings
+
+    heartbeat_s = get_settings().sse_heartbeat_s
+    last_seq = start_after
+    pubsub = await event_bus.open_subscription(task_id)
+    try:
+        # 先订阅再回放：订阅与回放之间产生的事件会出现在回放结果里，按 seq 去重
+        for ev in await _events_after(session, task_id, last_seq):
+            last_seq = ev.seq
+            yield _sse_event(ev)
+
+        status = await _task_status(session, task_id)
+        if status in TERMINAL_STATUSES:
+            yield f"event: end\ndata: {json.dumps({'status': str(status)})}\n\n"
+            return
+
+        while True:
+            if pubsub is not None:
+                try:
+                    msg = await pubsub.get_message(
+                        ignore_subscribe_messages=True, timeout=heartbeat_s
+                    )
+                except Exception:
+                    # 连接中断：本连接降级为轮询模式，流不中断
+                    await event_bus.close_subscription(pubsub)
+                    pubsub = None
+                    continue
+                if msg and msg.get("type") == "message":
+                    try:
+                        event = json.loads(msg["data"])
+                    except (json.JSONDecodeError, TypeError):
+                        event = None
+                    if event and event.get("seq", 0) > last_seq:
+                        last_seq = event["seq"]
+                        yield _sse_event(event)
+                        continue
+            else:
+                await asyncio.sleep(heartbeat_s)
+
+            # 心跳周期：DB 轮询兜底（Redis 不可用 / 发布间隙漏发），并检查终态
+            for ev in await _events_after(session, task_id, last_seq):
+                last_seq = ev.seq
+                yield _sse_event(ev)
+            status = await _task_status(session, task_id)
+            if status in TERMINAL_STATUSES:
+                yield f"event: end\ndata: {json.dumps({'status': str(status)})}\n\n"
+                return
+            yield ": heartbeat\n\n"
+    finally:
+        await event_bus.close_subscription(pubsub)

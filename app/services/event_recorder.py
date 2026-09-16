@@ -2,6 +2,26 @@ from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import AgentEvent, EventType, ResearchTask
+from app.services import event_bus
+
+
+def _event_dict(event: AgentEvent) -> dict:
+    # record_many 未逐行 refresh，server_default 的 created_at 可能未加载（异步下访问会抛
+    # MissingGreenlet）——实时推送缺该字段无碍，回放接口以 DB 为准。
+    try:
+        created_at = event.created_at.isoformat() if event.created_at else None
+    except Exception:
+        created_at = None
+    return {
+        "seq": event.seq,
+        "task_id": event.task_id,
+        "sub_task_id": event.sub_task_id,
+        "type": str(event.type),
+        "payload": event.payload or {},
+        "tokens": event.tokens,
+        "latency_ms": event.latency_ms,
+        "created_at": created_at,
+    }
 
 
 class EventRecorder:
@@ -44,6 +64,7 @@ class EventRecorder:
         self.session.add(event)
         await self.session.commit()
         await self.session.refresh(event)
+        await event_bus.publish_event(task_id, _event_dict(event))
         return event
 
     async def record_many(
@@ -76,4 +97,6 @@ class EventRecorder:
             )
         self.session.add_all(rows)
         await self.session.commit()
+        for row in rows:
+            await event_bus.publish_event(task_id, _event_dict(row))
         return rows
