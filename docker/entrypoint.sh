@@ -4,11 +4,11 @@ set -e
 
 case "$1" in
   api)
-    uv run alembic upgrade head
-    exec uv run uvicorn app.main:app --host 0.0.0.0 --port 8000
+    alembic upgrade head
+    exec uvicorn app.main:app --host 0.0.0.0 --port 8000
     ;;
   worker)
-    exec uv run arq app.worker.WorkerSettings
+    exec arq app.worker.WorkerSettings
     ;;
   *)
     exec "$@"
