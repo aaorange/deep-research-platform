@@ -1,21 +1,85 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { marked } from "marked";
-import { getReport } from "../api";
-import type { ReportOut, ReportSource } from "../types";
+import * as echarts from "echarts/core";
+import { BarChart, LineChart, PieChart } from "echarts/charts";
+import { GridComponent, LegendComponent, TooltipComponent } from "echarts/components";
+import { CanvasRenderer } from "echarts/renderers";
+import { exportUrl, getReport } from "../api";
+import { ChatPanel } from "./ChatPanel";
+import type { ChartSpec, ReportOut, ReportSource } from "../types";
+
+echarts.use([BarChart, LineChart, PieChart, GridComponent, LegendComponent, TooltipComponent, CanvasRenderer]);
 
 const CITE_RE = /\[(\d+)\]/g;
+const CHART_RE = /<!--\s*chart:(c\d+)\s*-->/g;
 const DEPTH_LABEL: Record<string, string> = { quick: "快速", std: "标准", deep: "深度" };
+const PALETTE = ["#2563eb", "#7c3aed", "#16a34a", "#d97706", "#dc2626", "#0891b2", "#db2777"];
+const TEXT2 = "#5c6470";
 
-/** markdown → 安全 HTML；[N] 先替换为交互角标 sup.cite 再交给 marked（保留 inline HTML）。 */
+/** markdown → 安全 HTML；先插图表容器再转 [N] 角标（保留 inline HTML）。 */
 function renderMarkdown(md: string): string {
-  const withCites = md.replace(
+  const withCharts = md.replace(
+    CHART_RE,
+    (_m, id: string) => `<div class="chart-block" data-chart="${id}"><div class="chart-title"></div><div class="chart-canvas"></div></div>`,
+  );
+  const withCites = withCharts.replace(
     CITE_RE,
     (_m, n: string) => `<sup class="cite" data-n="${n}">${n}</sup>`,
   );
   return DOMPurify.sanitize(marked.parse(withCites, { gfm: true, async: false }), {
-    ADD_ATTR: ["data-n"],
+    ADD_ATTR: ["data-n", "data-chart"],
   });
+}
+
+function buildOption(spec: ChartSpec): echarts.EChartsCoreOption {
+  if (spec.type === "pie") {
+    return {
+      color: PALETTE,
+      tooltip: { trigger: "item", textStyle: { fontSize: 12 } },
+      legend: { bottom: 0, itemWidth: 10, itemHeight: 10, textStyle: { color: TEXT2, fontSize: 11 } },
+      series: [
+        {
+          type: "pie",
+          radius: ["40%", "64%"],
+          center: ["50%", "42%"],
+          itemStyle: { borderRadius: 4, borderColor: "#fff", borderWidth: 2 },
+          label: { color: TEXT2, fontSize: 11 },
+          data: spec.x.map((name, i) => ({ name, value: spec.series[0].data[i] })),
+        },
+      ],
+    };
+  }
+  const multi = spec.series.length > 1;
+  return {
+    color: PALETTE,
+    tooltip: { trigger: "axis", textStyle: { fontSize: 12 } },
+    legend: multi
+      ? { top: 0, right: 0, itemWidth: 12, itemHeight: 8, textStyle: { color: TEXT2, fontSize: 11 } }
+      : undefined,
+    grid: { left: 8, right: 16, top: multi ? 34 : 16, bottom: 0, containLabel: true },
+    xAxis: {
+      type: "category",
+      data: spec.x,
+      axisTick: { show: false },
+      axisLine: { lineStyle: { color: "#e8eaed" } },
+      axisLabel: { color: TEXT2, fontSize: 11 },
+    },
+    yAxis: {
+      type: "value",
+      splitLine: { lineStyle: { color: "#f0f1f3" } },
+      axisLabel: { color: TEXT2, fontSize: 11 },
+    },
+    series: spec.series.map((s) => ({
+      name: s.name,
+      type: spec.type,
+      data: s.data,
+      smooth: spec.type === "line",
+      symbolSize: spec.type === "line" ? 6 : undefined,
+      barMaxWidth: 30,
+      itemStyle: spec.type === "bar" ? { borderRadius: [3, 3, 0, 0] } : undefined,
+    })),
+  };
 }
 
 function chipCls(n: number | null): string {
@@ -30,7 +94,9 @@ export function ReportView({ taskId, onBack }: { taskId: number; onBack: () => v
   const [state, setState] = useState<"loading" | "ready" | "empty">("loading");
   const [hoverNo, setHoverNo] = useState<number | null>(null);
   const [activeNo, setActiveNo] = useState<number | null>(null);
+  const [exportOpen, setExportOpen] = useState(false);
   const bodyRef = useRef<HTMLDivElement>(null);
+  const exportRef = useRef<HTMLDivElement>(null);
 
   const html = useMemo(
     () => (report ? renderMarkdown(report.markdown) : ""),
@@ -70,6 +136,42 @@ export function ReportView({ taskId, onBack }: { taskId: number; onBack: () => v
     }
   }, [activeNo, html]);
 
+  // 图表：markdown 落 DOM 后，按占位 data-chart 匹配规格并挂 ECharts；
+  // innerHTML 重建（换报告）时先 dispose 旧实例
+  useEffect(() => {
+    const root = bodyRef.current;
+    if (!root || !report) return;
+    const byId = new Map(report.chart_specs.map((c) => [c.id, c]));
+    const cleanup: (() => void)[] = [];
+    root.querySelectorAll<HTMLElement>(".chart-block").forEach((block) => {
+      const spec = byId.get(block.getAttribute("data-chart") ?? "");
+      if (!spec) return;
+      const titleEl = block.querySelector<HTMLElement>(".chart-title");
+      const canvasEl = block.querySelector<HTMLElement>(".chart-canvas");
+      if (!canvasEl) return;
+      if (titleEl) titleEl.textContent = spec.title;
+      const chart = echarts.init(canvasEl);
+      chart.setOption(buildOption(spec));
+      const ro = new ResizeObserver(() => chart.resize());
+      ro.observe(canvasEl);
+      cleanup.push(() => {
+        ro.disconnect();
+        chart.dispose();
+      });
+    });
+    return () => cleanup.forEach((fn) => fn());
+  }, [html, report]);
+
+  // 导出下拉：点击外部关闭
+  useEffect(() => {
+    if (!exportOpen) return;
+    const onDoc = (e: MouseEvent) => {
+      if (!exportRef.current?.contains(e.target as Node)) setExportOpen(false);
+    };
+    document.addEventListener("click", onDoc);
+    return () => document.removeEventListener("click", onDoc);
+  }, [exportOpen]);
+
   const scrollToCard = (no: number) => {
     document
       .getElementById(`rcard-${no}`)
@@ -98,6 +200,12 @@ export function ReportView({ taskId, onBack }: { taskId: number; onBack: () => v
     bodyRef.current
       ?.querySelector(`.cite[data-n="${no}"]`)
       ?.scrollIntoView({ behavior: "smooth", block: "center" });
+  };
+
+  /** 追问面板角标/chip：高亮并滚动信源卡 */
+  const onJumpSource = (no: number) => {
+    setActiveNo(no);
+    scrollToCard(no);
   };
 
   if (state === "loading") {
@@ -135,9 +243,28 @@ export function ReportView({ taskId, onBack }: { taskId: number; onBack: () => v
             <span>{DEPTH_LABEL[report.depth] ?? report.depth}研究</span>
             <span>信源 {report.sources.length} 篇</span>
             <span>报告 {report.markdown.length.toLocaleString()} 字</span>
+            {report.chart_specs.length > 0 && <span>图表 {report.chart_specs.length} 张</span>}
             <span>综合 {report.token_total.toLocaleString()} tokens</span>
             <span>¥ {report.cost_cny.toFixed(2)}</span>
           </div>
+        </div>
+        <div className="rpt-export" ref={exportRef}>
+          <button className="btn" onClick={() => setExportOpen((v) => !v)}>
+            导出 ▾
+          </button>
+          {exportOpen && (
+            <div className="rpt-export-menu">
+              <a href={exportUrl(report.report_id, "md")} onClick={() => setExportOpen(false)}>
+                Markdown (.md)
+              </a>
+              <a href={exportUrl(report.report_id, "html")} onClick={() => setExportOpen(false)}>
+                网页 (.html)
+              </a>
+              <a href={exportUrl(report.report_id, "pdf")} onClick={() => setExportOpen(false)}>
+                PDF (.pdf)
+              </a>
+            </div>
+          )}
         </div>
       </div>
 
@@ -199,6 +326,8 @@ export function ReportView({ taskId, onBack }: { taskId: number; onBack: () => v
             ))}
           </div>
         </aside>
+
+        <ChatPanel taskId={taskId} sources={report.sources} onJumpSource={onJumpSource} />
       </div>
     </div>
   );

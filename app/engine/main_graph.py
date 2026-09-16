@@ -132,7 +132,12 @@ class SubTaskStoreProtocol(Protocol):
     async def synthesis_inputs(self, task_id: int) -> tuple[list[dict], list[dict]]: ...
 
     async def persist_report(
-        self, task_id: int, markdown: str, citation_map: dict[int, int], token_total: int
+        self,
+        task_id: int,
+        markdown: str,
+        citation_map: dict[int, int],
+        token_total: int,
+        chart_specs: list[dict] | None = None,
     ) -> int: ...
 
     async def add_usage(
@@ -519,7 +524,11 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
         degraded = is_degraded(used, budget)
         markdown = draft.markdown + (disclaimer_md(used, budget) if degraded else "")
         report_id = await deps.store.persist_report(
-            task_id, markdown, draft.citation_map, usage.total_tokens if usage else 0
+            task_id,
+            markdown,
+            draft.citation_map,
+            usage.total_tokens if usage else 0,
+            draft.chart_specs,
         )
         if usage is not None:
             await deps.store.add_usage(

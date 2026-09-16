@@ -111,6 +111,21 @@ class ReportOut(BaseModel):
     token_total: int
     cost_cny: float
     sources: list[ReportSourceOut] = Field(description="按展示编号排序的被引用信源")
+    chart_specs: list[dict] = Field(default_factory=list, description="ECharts 图表规格")
+
+
+class ChatCreate(BaseModel):
+    text: str = Field(min_length=2, max_length=2000)
+
+
+class ChatMessageOut(BaseModel):
+    id: int
+    role: str
+    content: str
+    cited_source_ids: list[int] = Field(default_factory=list)
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
 
 
 def now_utc() -> datetime:

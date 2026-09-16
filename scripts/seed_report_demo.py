@@ -24,14 +24,62 @@ SUBS = [
 ]
 
 SOURCES = [
-    ("https://www.nmpa.gov.cn/xxgk/zhcexx/20250312.htm", "国家药监局：AI 辅助诊断软件优先审批通道公告", "nmpa.gov.cn", 5, 0.95),
-    ("https://www.cn-healthcare.com/articlewm/20250601/content-1632101.html", "2025 医疗 AI 三类证审批盘点：47 张证背后的提速逻辑", "cn-healthcare.com", 4, 0.85),
-    ("https://www.36kr.com/p/3182764501", "医学影像大模型：头部三甲医院的采购清单变了", "36kr.com", 3, 0.7),
-    ("https://www.jiqizhixin.com/articles/6f3e9a2b", "临床决策支持系统进入大模型时代：一场安静的重构", "jiqizhixin.com", 4, 0.75),
-    ("https://www.vcbeat.top/51c9f8e2", "医疗大模型商业化报告：市场规模与厂商份额 2025", "vcbeat.top", 4, 0.8),
-    ("https://www.phirda.com/articles/28f1a3d0", "药企引入大模型做蛋白质结构预测的得与失", "phirda.com", 3, 0.65),
-    ("https://www.gov.cn/zhengce/202504/content_7021.htm", "国务院办公厅：促进和规范健康医疗大数据应用发展的指导意见", "gov.cn", 5, 0.9),
-    ("https://www.caict.ac.cn/kxyj/qwfb/202505/t20250520_403210.html", "中国信通院：医疗大模型数据合规白皮书（2025）", "caict.ac.cn", 4, 0.85),
+    (
+        "https://www.nmpa.gov.cn/xxgk/zhcexx/20250312.htm",
+        "国家药监局：AI 辅助诊断软件优先审批通道公告",
+        "nmpa.gov.cn",
+        5,
+        0.95,
+    ),
+    (
+        "https://www.cn-healthcare.com/articlewm/20250601/content-1632101.html",
+        "2025 医疗 AI 三类证审批盘点：47 张证背后的提速逻辑",
+        "cn-healthcare.com",
+        4,
+        0.85,
+    ),
+    (
+        "https://www.36kr.com/p/3182764501",
+        "医学影像大模型：头部三甲医院的采购清单变了",
+        "36kr.com",
+        3,
+        0.7,
+    ),
+    (
+        "https://www.jiqizhixin.com/articles/6f3e9a2b",
+        "临床决策支持系统进入大模型时代：一场安静的重构",
+        "jiqizhixin.com",
+        4,
+        0.75,
+    ),
+    (
+        "https://www.vcbeat.top/51c9f8e2",
+        "医疗大模型商业化报告：市场规模与厂商份额 2025",
+        "vcbeat.top",
+        4,
+        0.8,
+    ),
+    (
+        "https://www.phirda.com/articles/28f1a3d0",
+        "药企引入大模型做蛋白质结构预测的得与失",
+        "phirda.com",
+        3,
+        0.65,
+    ),
+    (
+        "https://www.gov.cn/zhengce/202504/content_7021.htm",
+        "国务院办公厅：促进和规范健康医疗大数据应用发展的指导意见",
+        "gov.cn",
+        5,
+        0.9,
+    ),
+    (
+        "https://www.caict.ac.cn/kxyj/qwfb/202505/t20250520_403210.html",
+        "中国信通院：医疗大模型数据合规白皮书（2025）",
+        "caict.ac.cn",
+        4,
+        0.85,
+    ),
 ]
 
 NOTES = {
@@ -53,6 +101,8 @@ REPORT = """# 2025 年国产大模型在医疗行业的落地情况
 
 国家药监局 3 月将 AI 辅助诊断软件纳入优先审批通道，三类证平均审批周期从 26 个月压缩至 16 个月[1]；截至 6 月底已有 47 张医疗 AI 三类证获批，其中 11 张为大模型驱动产品[2]。
 
+<!-- chart:c1 -->
+
 > 审批提速的直接后果是商业闭环首次跑通：厂商拿到证即可进院收费，投资人对「有证公司」的估值容忍度明显放宽[2]。
 
 国务院办公厅 4 月印发的健康医疗大数据指导意见，进一步明确了数据的分类分级管理要求，为训练数据的合规使用划定了边界[7]。
@@ -65,6 +115,8 @@ REPORT = """# 2025 年国产大模型在医疗行业的落地情况
 
 **药企研发**侧，蛋白质结构预测引入国产大模型后，部分靶点筛选周期从 6 周缩短至 9 天；14 家创新药企公开确认采购，但晶型预测准确率仍低于国际闭源方案[6]。
 
+<!-- chart:c2 -->
+
 | 场景 | 代表能力 | 计费模式 | 渗透阶段 |
 | --- | --- | --- | --- |
 | 医学影像 | 肺结节/眼底筛查 | 按例计费 | 规模化 |
@@ -76,6 +128,8 @@ REPORT = """# 2025 年国产大模型在医疗行业的落地情况
 
 2025 年中国医疗大模型市场规模预计 82 亿元，头部厂商合计份额接近七成，商业模式以「按年订阅 + 调用计费」混合为主[5]。付费意愿两级分化明显：三级医院贡献约 75% 的收入，基层机构仍以财政项目制为主[5]。
 
+<!-- chart:c3 -->
+
 ## 四、挑战：合规、预算与信任
 
 数据合规是最大摩擦——训练数据需完成脱敏与授权双链条，跨院数据流通依赖隐私计算平台，院内数据出域仍受严格限制[8]。叠加医生对幻觉风险的顾虑，厂商普遍以「建议 + 医生确认」的人机协同模式消化信任问题[5][8]。
@@ -84,6 +138,30 @@ REPORT = """# 2025 年国产大模型在医疗行业的落地情况
 
 医疗正在成为国产大模型第一个「证照齐全」的规模化行业。审批通道打开供给，影像与病历质控场景承接需求，头部厂商的份额集中趋势短期不会逆转；真正的分水岭在于谁能率先把合规成本做低，把医生信任做实[1][5][8]。
 """
+
+CHARTS = [
+    {
+        "id": "c1",
+        "title": "三类证平均审批周期（月）",
+        "type": "bar",
+        "x": ["常规通道", "优先审批通道"],
+        "series": [{"name": "审批周期（月）", "data": [26, 16]}],
+    },
+    {
+        "id": "c2",
+        "title": "蛋白质靶点筛选周期（天）",
+        "type": "bar",
+        "x": ["传统方法", "大模型辅助"],
+        "series": [{"name": "筛选周期（天）", "data": [42, 9]}],
+    },
+    {
+        "id": "c3",
+        "title": "医疗大模型收入按医院等级（%）",
+        "type": "pie",
+        "x": ["三级医院", "基层与其他机构"],
+        "series": [{"name": "收入占比", "data": [75, 25]}],
+    },
+]
 
 
 async def main() -> None:
@@ -132,11 +210,12 @@ async def main() -> None:
                 version=1,
                 markdown=REPORT,
                 citation_map=citation_map,
+                chart_specs=CHARTS,
                 token_total=9_864,
             )
         )
         await session.commit()
-        print(f"seeded done-task id={task.id} with {len(src_ids)} sources")
+        print(f"seeded done-task id={task.id} with {len(src_ids)} sources, {len(CHARTS)} charts")
 
 
 if __name__ == "__main__":

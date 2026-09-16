@@ -58,6 +58,20 @@ export interface ReportSource {
   excerpts: string[];
 }
 
+export interface ChartSeries {
+  name: string;
+  data: number[];
+}
+
+/** ECharts 图表规格：与后端 ChartSpec 契约一致（bar/line/pie） */
+export interface ChartSpec {
+  id: string;
+  title: string;
+  type: "bar" | "line" | "pie";
+  x: string[];
+  series: ChartSeries[];
+}
+
 export interface ReportOut {
   report_id: number;
   task_id: number;
@@ -69,6 +83,16 @@ export interface ReportOut {
   token_total: number;
   cost_cny: number;
   sources: ReportSource[];
+  chart_specs: ChartSpec[];
+}
+
+export interface ChatMessage {
+  id: number;
+  role: "user" | "assistant";
+  content: string;
+  /** 回答引用的信源库 id（按出现顺序去重） */
+  cited_source_ids: number[];
+  created_at: string;
 }
 
 export interface AgentEvent {

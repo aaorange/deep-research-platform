@@ -245,12 +245,18 @@ class SubTaskPersister:
         return notes, sources
 
     async def persist_report(
-        self, task_id: int, markdown: str, citation_map: dict[int, int], token_total: int
+        self,
+        task_id: int,
+        markdown: str,
+        citation_map: dict[int, int],
+        token_total: int,
+        chart_specs: list[dict] | None = None,
     ) -> int:
         row = Report(
             task_id=task_id,
             version=1,
             markdown=markdown,
+            chart_specs=chart_specs or [],
             citation_map={str(n): sid for n, sid in citation_map.items()},
             token_total=token_total,
         )

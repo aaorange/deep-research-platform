@@ -99,6 +99,110 @@ def test_schema_validator_rejects_invented_anchor():
     assert ok.markdown == "合法 [11][7]"
 
 
+# ---- 图表规格（D16） ----
+
+
+def chart_payload(**over):
+    payload = {
+        "id": "c1",
+        "title": "市场规模",
+        "type": "bar",
+        "x": ["2023", "2024", "2025"],
+        "series": [{"name": "亿元", "data": [42, 58, 82]}],
+    }
+    payload.update(over)
+    return payload
+
+
+def test_chart_spec_shape_validation():
+    schema = make_report_schema({11})
+    ok = schema.model_validate(
+        {"markdown": "数据段 [11]\n<!-- chart:c1 -->", "charts": [chart_payload()]}
+    )
+    assert ok.charts[0].type == "bar"
+    assert ok.charts[0].series[0].data == [42, 58, 82]
+
+    # 系列长度与类目轴不一致
+    with pytest.raises(Exception, match="不一致"):
+        schema.model_validate(
+            {"markdown": "<!-- chart:c1 -->", "charts": [chart_payload(x=["2023", "2024"])]}
+        )
+    # pie 只允许单系列
+    with pytest.raises(Exception, match="pie"):
+        schema.model_validate(
+            {
+                "markdown": "<!-- chart:c1 -->",
+                "charts": [
+                    chart_payload(
+                        type="pie",
+                        series=[
+                            {"name": "a", "data": [1, 2, 3]},
+                            {"name": "b", "data": [1, 2, 3]},
+                        ],
+                    )
+                ],
+            }
+        )
+    # 空类目轴
+    with pytest.raises(Exception, match="类目轴"):
+        schema.model_validate({"markdown": "<!-- chart:c1 -->", "charts": [chart_payload(x=[])]})
+
+
+def test_schema_validator_chart_placeholder_consistency():
+    schema = make_report_schema({11})
+    # 占位符无规格
+    with pytest.raises(Exception, match="缺少图表规格"):
+        schema.model_validate({"markdown": "数据段 [11]\n<!-- chart:c1 -->", "charts": []})
+    # 规格无占位符
+    with pytest.raises(Exception, match="未在 markdown 中放置占位符"):
+        schema.model_validate({"markdown": "数据段 [11]", "charts": [chart_payload()]})
+    # id 重复
+    with pytest.raises(Exception, match="重复"):
+        schema.model_validate(
+            {
+                "markdown": "<!-- chart:c1 --><!-- chart:c1 -->",
+                "charts": [chart_payload(), chart_payload()],
+            }
+        )
+
+
+async def test_write_report_passes_chart_specs(monkeypatch):
+    notes, sources = make_inputs()
+    client = make_client(
+        json_completion(
+            {
+                "markdown": "# 报告\n趋势数据 [11]。\n<!-- chart:c1 -->",
+                "charts": [
+                    {
+                        "id": "c1",
+                        "title": "市场规模",
+                        "type": "bar",
+                        "x": ["2023", "2024", "2025"],
+                        "series": [{"name": "亿元", "data": [42, 58, 82]}],
+                    }
+                ],
+            }
+        )
+    )
+    monkeypatch.setattr(
+        synthesizer,
+        "get_reasoner_instructor",
+        lambda: instructor.from_openai(client, mode=instructor.Mode.JSON),
+    )
+
+    draft, _ = await write_report("问题", None, notes, sources)
+    assert draft.markdown.endswith("<!-- chart:c1 -->")
+    assert draft.chart_specs == [
+        {
+            "id": "c1",
+            "title": "市场规模",
+            "type": "bar",
+            "x": ["2023", "2024", "2025"],
+            "series": [{"name": "亿元", "data": [42.0, 58.0, 82.0]}],
+        }
+    ]
+
+
 async def test_write_report_happy_path(monkeypatch):
     notes, sources = make_inputs()
     client = make_client(

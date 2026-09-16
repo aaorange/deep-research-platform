@@ -87,6 +87,7 @@ class ResearchTask(Base):
     sources: Mapped[list["Source"]] = relationship(back_populates="task")
     notes: Mapped[list["Note"]] = relationship(back_populates="task")
     reports: Mapped[list["Report"]] = relationship(back_populates="task")
+    chat_messages: Mapped[list["ChatMessage"]] = relationship(back_populates="task")
 
     @property
     def instructions(self) -> list:
@@ -164,13 +165,42 @@ class Report(Base):
     task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), unique=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     markdown: Mapped[str] = mapped_column(Text)
-    chart_specs: Mapped[dict | None] = mapped_column(JSONB, default=None)
+    chart_specs: Mapped[dict | None] = mapped_column(
+        JSONB,
+        default=None,
+        comment="ECharts 图表规格列表，报告 markdown 中以 <!-- chart:ID --> 占位",
+    )
     citation_map: Mapped[dict | None] = mapped_column(
         JSONB, default=None, comment="展示编号 → 信源 id，报告阅读页渲染信源卡"
     )
     token_total: Mapped[int] = mapped_column(Integer, default=0)
 
     task: Mapped[ResearchTask] = relationship(back_populates="reports")
+
+
+class ChatRole(enum.StrEnum):
+    user = "user"
+    assistant = "assistant"
+
+
+class ChatMessage(Base):
+    """报告追问消息：多轮对话，assistant 回答锚定信源库 id 可溯源。"""
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), index=True)
+    role: Mapped[ChatRole] = mapped_column(Enum(ChatRole, name="chat_role"))
+    content: Mapped[str] = mapped_column(Text)
+    cited_source_ids: Mapped[list | None] = mapped_column(
+        JSONB,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+        comment="assistant 回答引用的信源库 id 列表（[N] 锚点提取）",
+    )
+    created_at: Mapped[DateTime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    task: Mapped[ResearchTask] = relationship(back_populates="chat_messages")
 
 
 class EvalRun(Base):

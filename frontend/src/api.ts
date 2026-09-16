@@ -1,4 +1,12 @@
-import type { AgentEvent, Depth, ReportOut, SourceOut, TaskDetail, TaskOut } from "./types";
+import type {
+  AgentEvent,
+  ChatMessage,
+  Depth,
+  ReportOut,
+  SourceOut,
+  TaskDetail,
+  TaskOut,
+} from "./types";
 
 const BASE = "/api/research/tasks";
 
@@ -40,3 +48,14 @@ export const listEvents = (id: number, afterSeq = 0) =>
 
 /** SSE 流地址：EventSource 原生断线自动重连并携带 Last-Event-ID，后端按 seq 增量补发。 */
 export const sseUrl = (id: number) => `${BASE}/${id}/events/stream`;
+
+/** 追问历史（报告页进入时加载对话）。 */
+export const listChat = (id: number) => req<ChatMessage[]>(`/${id}/chat`);
+
+/** 发送追问：仅基于已收集笔记回答（不联网）。 */
+export const sendChat = (id: number, text: string) =>
+  req<ChatMessage>(`/${id}/chat`, { method: "POST", body: JSON.stringify({ text }) });
+
+/** 报告导出地址：md / html / pdf（Content-Disposition 附件下载）。 */
+export const exportUrl = (reportId: number, format: "md" | "html" | "pdf") =>
+  `/api/reports/${reportId}/export?format=${format}`;

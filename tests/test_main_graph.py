@@ -125,7 +125,7 @@ class FakeStore:
         ]
         return self.synthesis_notes, sources
 
-    async def persist_report(self, task_id, markdown, citation_map, token_total):
+    async def persist_report(self, task_id, markdown, citation_map, token_total, chart_specs=None):
         report_id = self._next_report_id
         self._next_report_id += 1
         self.reports.append(
@@ -135,6 +135,7 @@ class FakeStore:
                 "markdown": markdown,
                 "citation_map": citation_map,
                 "token_total": token_total,
+                "chart_specs": chart_specs or [],
             }
         )
         return report_id
@@ -228,7 +229,10 @@ def make_report(error=None):
         if error:
             raise error
         draft = SimpleNamespace(
-            markdown=f"# {question}\n\n结论 [1]。", citation_map={1: 101}, n_citations=1
+            markdown=f"# {question}\n\n结论 [1]。",
+            citation_map={1: 101},
+            n_citations=1,
+            chart_specs=[],
         )
         return draft, SimpleNamespace(prompt_tokens=800, completion_tokens=1500, total_tokens=2300)
 

@@ -67,7 +67,7 @@ def fake_plan(outline):
 def fake_report(markdown="# 报告\n\n结论 [1]。"):
     async def write_report(question, background, notes, sources):
         return (
-            SimpleNamespace(markdown=markdown, citation_map={1: 1}, n_citations=1),
+            SimpleNamespace(markdown=markdown, citation_map={1: 1}, n_citations=1, chart_specs=[]),
             REPORT_USAGE,
         )
 

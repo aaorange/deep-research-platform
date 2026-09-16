@@ -6,12 +6,15 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import AgentEvent, Note, Report, ResearchTask, Source, TaskStatus
+from app.config import get_settings
+from app.db import AgentEvent, ChatMessage, ChatRole, Note, Report, ResearchTask, Source, TaskStatus
 from app.db.base import get_session
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import DEPTH_BUDGETS
 from app.queue import enqueue_research, get_queue
 from app.schemas.task import (
+    ChatCreate,
+    ChatMessageOut,
     EventOut,
     InstructionCreate,
     InstructionOut,
@@ -24,6 +27,7 @@ from app.schemas.task import (
     TaskOut,
 )
 from app.services import event_bus
+from app.services.chat import write_chat_reply
 from app.services.excerpt import extract_excerpts
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
@@ -193,10 +197,14 @@ async def get_report(task_id: int, session: AsyncSession = Depends(get_session))
     note_contents: list[str] = []
     if cited_ids:
         rows = (
-            await session.execute(
-                select(Source).where(Source.task_id == task_id, Source.id.in_(cited_ids))
+            (
+                await session.execute(
+                    select(Source).where(Source.task_id == task_id, Source.id.in_(cited_ids))
+                )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         source_rows = {s.id: s for s in rows}
         note_contents = list(
             (
@@ -232,7 +240,89 @@ async def get_report(task_id: int, session: AsyncSession = Depends(get_session))
         token_total=report.token_total,
         cost_cny=task.cost_cny,
         sources=sources,
+        chart_specs=report.chart_specs or [],
     )
+
+
+@router.get("/{task_id}/chat", response_model=list[ChatMessageOut])
+async def list_chat(
+    task_id: int, session: AsyncSession = Depends(get_session)
+) -> list[ChatMessage]:
+    """追问历史：报告页进入时加载对话。"""
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    result = await session.execute(
+        select(ChatMessage).where(ChatMessage.task_id == task_id).order_by(ChatMessage.id)
+    )
+    return list(result.scalars().all())
+
+
+@router.post("/{task_id}/chat", response_model=ChatMessageOut, status_code=201)
+async def send_chat(
+    task_id: int, body: ChatCreate, session: AsyncSession = Depends(get_session)
+) -> ChatMessage:
+    """报告追问：仅基于已收集笔记回答（不联网、不触发新搜索）。
+
+    锚点校验保证回答可溯源——[N] 只能是信源库 id，cited_source_ids
+    供 UI 标注信源范围。LLM 失败时 502，user 消息不落库（重试无副作用）。
+    """
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status != TaskStatus.done:
+        raise HTTPException(status_code=409, detail="chat is available after the task is done")
+    report = (
+        (
+            await session.execute(
+                select(Report.id)
+                .where(Report.task_id == task_id)
+                .order_by(Report.id.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if report is None:
+        raise HTTPException(status_code=409, detail="report not generated")
+
+    persister = SubTaskPersister(session)
+    notes, sources = await persister.synthesis_inputs(task_id)
+    if not notes:
+        raise HTTPException(status_code=409, detail="no notes collected for this task")
+    history_rows = list(
+        (
+            await session.execute(
+                select(ChatMessage).where(ChatMessage.task_id == task_id).order_by(ChatMessage.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    history = [{"role": m.role.value, "content": m.content} for m in history_rows]
+
+    try:
+        reply, usage = await write_chat_reply(task.question, notes, sources, history, body.text)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"chat failed: {type(e).__name__}") from e
+
+    session.add(ChatMessage(task_id=task_id, role=ChatRole.user, content=body.text))
+    assistant = ChatMessage(
+        task_id=task_id,
+        role=ChatRole.assistant,
+        content=reply.answer,
+        cited_source_ids=reply.cited_ids,
+    )
+    session.add(assistant)
+    if usage is not None:
+        await persister.add_usage(
+            task_id, get_settings().llm_model_chat, usage.prompt_tokens, usage.completion_tokens
+        )
+    else:
+        await session.commit()
+    await session.refresh(assistant)
+    return assistant
 
 
 @router.get("/{task_id}/events", response_model=list[EventOut])
