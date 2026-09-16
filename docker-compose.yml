@@ -1,0 +1,80 @@
+# 生产部署：一条命令拉起全栈（前端 8080 端口对外，pg/redis 仅内网）
+# 使用：cp .env.example .env 填入密钥后  docker compose up -d --build
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: research
+      POSTGRES_PASSWORD: research
+      POSTGRES_DB: research
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U research -d research"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    restart: unless-stopped
+
+  backend:
+    build: .
+    command: api
+    environment:
+      DATABASE_URL: postgresql+asyncpg://research:research@postgres:5432/research
+      REDIS_URL: redis://redis:6379/1
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请先在 .env 填入 DEEPSEEK_API_KEY}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL_CHAT: ${LLM_MODEL_CHAT:-deepseek-chat}
+      LLM_MODEL_REASONER: ${LLM_MODEL_REASONER:-deepseek-reasoner}
+      BOCHA_API_KEY: ${BOCHA_API_KEY:-}
+      JINA_API_KEY: ${JINA_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "uv", "run", "python", "-c", "import httpx; httpx.get('http://localhost:8000/api/health').raise_for_status()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: worker
+    environment:
+      DATABASE_URL: postgresql+asyncpg://research:research@postgres:5432/research
+      REDIS_URL: redis://redis:6379/1
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:?请先在 .env 填入 DEEPSEEK_API_KEY}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      LLM_MODEL_CHAT: ${LLM_MODEL_CHAT:-deepseek-chat}
+      LLM_MODEL_REASONER: ${LLM_MODEL_REASONER:-deepseek-reasoner}
+      BOCHA_API_KEY: ${BOCHA_API_KEY:-}
+      JINA_API_KEY: ${JINA_API_KEY:-}
+    depends_on:
+      backend:
+        condition: service_healthy  # 等 backend 完成 alembic 迁移，避免并发建表
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:

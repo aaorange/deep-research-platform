@@ -1,0 +1,17 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+.ruff_cache
+.idea
+.vscode
+.tmp
+.env
+.env.production
+docs
+tests
+scripts
+frontend
+*.md
+docker-compose.dev.yml
