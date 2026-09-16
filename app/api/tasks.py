@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import AgentEvent, ResearchTask, TaskStatus
+from app.db import AgentEvent, ResearchTask, Source, TaskStatus
 from app.db.base import get_session
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import DEPTH_BUDGETS
@@ -15,6 +15,7 @@ from app.schemas.task import (
     EventOut,
     InstructionCreate,
     InstructionOut,
+    SourceOut,
     TaskControl,
     TaskCreate,
     TaskDetail,
@@ -144,6 +145,18 @@ async def control_task(
         await enqueue_research(queue, task_id)
     await session.refresh(task)
     return task
+
+
+@router.get("/{task_id}/sources", response_model=list[SourceOut])
+async def list_sources(task_id: int, session: AsyncSession = Depends(get_session)) -> list[Source]:
+    """任务信源列表：右栏信源卡数据源（含可信度与新鲜度评分）。"""
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    result = await session.execute(
+        select(Source).where(Source.task_id == task_id).order_by(Source.id)
+    )
+    return list(result.scalars().all())
 
 
 @router.get("/{task_id}/events", response_model=list[EventOut])

@@ -77,5 +77,16 @@ class EventOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class SourceOut(BaseModel):
+    id: int
+    url: str
+    title: str | None
+    domain: str | None
+    credibility: int | None
+    freshness: float | None
+
+    model_config = {"from_attributes": True}
+
+
 def now_utc() -> datetime:
     return datetime.now(UTC)

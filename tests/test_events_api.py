@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.tasks import stream_events
 from app.config import get_settings
-from app.db import Base, EventType, ResearchTask, TaskStatus
+from app.db import Base, EventType, ResearchTask, Source, TaskStatus
 from app.db.base import get_session
 from app.main import app
 from app.queue import get_queue
@@ -171,6 +171,34 @@ async def test_sse_http_headers_for_terminal_task(env):
     assert "event: end" in resp.text
 
     resp = await c.get("/api/research/tasks/99999/events/stream")
+    assert resp.status_code == 404
+
+
+async def test_list_sources(env):
+    c, maker = env
+    task_id = (await c.post("/api/research/tasks", json={"question": "信源测试"})).json()["id"]
+
+    async with maker() as session:
+        session.add(
+            Source(
+                task_id=task_id,
+                url="https://example.com/a",
+                title="示例信源",
+                domain="example.com",
+                credibility=4,
+                freshness=0.8,
+            )
+        )
+        await session.commit()
+
+    resp = await c.get(f"/api/research/tasks/{task_id}/sources")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert body[0]["url"] == "https://example.com/a"
+    assert body[0]["credibility"] == 4
+
+    resp = await c.get("/api/research/tasks/99999/sources")
     assert resp.status_code == 404
 
 
