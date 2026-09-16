@@ -9,11 +9,12 @@ WORKDIR /app
 # uv 管理依赖（pip 安装 uv 本体，避免依赖 ghcr.io）
 RUN pip install --no-cache-dir -i https://mirrors.cloud.tencent.com/pypi/simple uv
 
-# 依赖层：先拷 lockfile 利用构建缓存
+# 依赖层：先拷 lockfile 利用构建缓存（国内源加速）
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev --default-index https://mirrors.cloud.tencent.com/pypi/simple
 
-# crawl4ai 渲染层：本地 Chromium
+# crawl4ai 渲染层：本地 Chromium（npmmirror 加速浏览器下载）
+ENV PLAYWRIGHT_DOWNLOAD_HOST=https://registry.npmmirror.com/-/binary/playwright
 RUN uv run playwright install --with-deps chromium
 
 COPY alembic.ini ./
