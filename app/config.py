@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     llm_model_reasoner: str = "deepseek-reasoner"
 
     bocha_api_key: str = ""
+    # 博查搜索单次调用价格（元/次）：缓存命中一次即节省一次调用，成本看板折算用
+    bocha_price_per_call: float = 0.003
 
     jina_api_key: str = ""  # 可选，配置后走更高配额通道
 

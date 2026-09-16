@@ -13,10 +13,12 @@ export function TaskList({
   tasks,
   selectedId,
   onSelect,
+  onDelete,
 }: {
   tasks: TaskOut[];
   selectedId: number | null;
   onSelect: (id: number) => void;
+  onDelete: (t: TaskOut) => void;
 }) {
   if (tasks.length === 0) {
     return <div className="empty">还没有任务</div>;
@@ -37,6 +39,16 @@ export function TaskList({
             <span>{t.depth}</span>
             <span>¥ {t.cost_cny.toFixed(2)}</span>
           </div>
+          <button
+            className="task-del"
+            title="删除任务"
+            onClick={(e) => {
+              e.stopPropagation();
+              onDelete(t);
+            }}
+          >
+            ✕
+          </button>
         </div>
       ))}
     </>

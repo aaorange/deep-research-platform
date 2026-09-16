@@ -284,10 +284,18 @@ class SubTaskPersister:
 
     async def mark_task_running(
         self, task_id: int, thread_id: str | None = None, run_token: str | None = None
-    ) -> None:
-        await self.session.execute(
+    ) -> bool:
+        """认领任务：仅当当前处于 queued/running/failed 时置 running 并写入新令牌。
+
+        返回 False 表示任务在排队真空期被暂停（或已进终态），调用方应直接退出，
+        不得覆盖控制方写入的状态。
+        """
+        result = await self.session.execute(
             update(ResearchTask)
-            .where(ResearchTask.id == task_id)
+            .where(
+                ResearchTask.id == task_id,
+                ResearchTask.status.in_((TaskStatus.queued, TaskStatus.running, TaskStatus.failed)),
+            )
             .values(
                 status=TaskStatus.running,
                 error_msg=None,
@@ -296,6 +304,7 @@ class SubTaskPersister:
             )
         )
         await self.session.commit()
+        return bool(result.rowcount)
 
     async def finish_task(
         self, task_id: int, done: bool, error: str | None = None, run_token: str | None = None

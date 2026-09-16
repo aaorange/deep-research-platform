@@ -5,8 +5,9 @@
 session 并发安全。子任务状态（running→done/failed）随执行回写。
 """
 
-from app.db import SubTaskStatus
+from app.db import SubTaskStatus, TaskStatus
 from app.db.base import SessionLocal
+from app.engine.main_graph import JobSupersededError
 from app.engine.note_writer import write_note
 from app.engine.persister import SubTaskPersister
 from app.engine.subgraph import WorkerDeps, build_worker_graph
@@ -16,12 +17,28 @@ from app.tools.read_page import read_page
 from app.tools.web_search import web_search
 
 
-def make_sub_task_runner(verbose: bool = False):
-    """返回 WorkerRunner；verbose=True 时 worker 事件同步打印（CLI 模式）。"""
+def make_sub_task_runner(verbose: bool = False, run_token: str | None = None):
+    """返回 WorkerRunner；verbose=True 时 worker 事件同步打印（CLI 模式）。
+
+    run_token：job 所有权令牌；子任务内每步（搜索/读页/笔记前）复查
+    (status, token)，用户终止/暂停后最多一个工具调用的延迟即退出，
+    而非等整个飞行批次跑完。
+    """
 
     async def run_worker(task_id: int, sub_task: dict, max_pages: int) -> dict:
         async with SessionLocal() as session:
             persister = SubTaskPersister(session)
+
+            async def fence() -> None:
+                status, current = await persister.task_run_state(task_id)
+                if status != TaskStatus.running or current != run_token:
+                    reason = (
+                        f"task {getattr(status, 'value', status)}"
+                        if status != TaskStatus.running
+                        else "superseded"
+                    )
+                    raise JobSupersededError(reason)
+
             await persister.mark_sub_task_status(sub_task["id"], SubTaskStatus.running)
 
             recorder = PrintingRecorder(session) if verbose else EventRecorder(session)
@@ -31,6 +48,7 @@ def make_sub_task_runner(verbose: bool = False):
                 write_note=write_note,
                 recorder=recorder,
                 persister=persister,
+                fence=fence if run_token else None,
             )
             graph = build_worker_graph(deps)
             final = await graph.ainvoke(

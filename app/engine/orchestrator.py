@@ -47,16 +47,27 @@ async def execute_research(
             raise ValueError(f"task {task_id} not found")
         if task.status in (TaskStatus.done, TaskStatus.canceled, TaskStatus.stopped):
             raise ValueError(f"task {task_id} in terminal status {task.status.value}")
+        if task.status == TaskStatus.paused:
+            # 排队真空期被用户暂停的 job：worker 取到后直接退出，不置 running。
+            # 状态归控制方所有，不回写终态。
+            logger.info("task %s paused before job start, exit", task_id)
+            return {"task_id": task_id, "status": "paused"}
 
         persister = SubTaskPersister(session)
         run_token = uuid.uuid4().hex
-        await persister.mark_task_running(task_id, thread_id_for_task(task_id), run_token=run_token)
+        # 原子认领：入口读状态与 UPDATE 之间被并发暂停时，条件更新不命中，本 job 退出
+        claimed = await persister.mark_task_running(
+            task_id, thread_id_for_task(task_id), run_token=run_token
+        )
+        if not claimed:
+            logger.info("task %s lost claim (paused/terminal), exit", task_id)
+            return {"task_id": task_id, "status": "paused"}
 
         question, background, depth = task.question, task.background, task.depth
         recorder = PrintingRecorder(session) if verbose else EventRecorder(session)
         deps = OrchestratorDeps(
             write_plan=write_plan,
-            run_worker=make_sub_task_runner(verbose=verbose),
+            run_worker=make_sub_task_runner(verbose=verbose, run_token=run_token),
             write_report=write_report,
             reflect=reflect_on_coverage,
             recorder=recorder,

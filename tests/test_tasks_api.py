@@ -1,8 +1,19 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.db import Base, ResearchTask, TaskStatus
+from app.db import (
+    AgentEvent,
+    Base,
+    EventType,
+    Note,
+    ResearchTask,
+    Source,
+    SubTask,
+    SubTaskStatus,
+    TaskStatus,
+)
 from app.db.base import get_session
 from app.main import app
 from app.queue import get_queue
@@ -149,7 +160,11 @@ async def test_control_transitions(client: AsyncClient):
     assert queue.jobs == [("run_research_task", (task_id,))]
 
     resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "pause"})
-    assert resp.status_code == 409  # queued 不可暂停
+    assert resp.status_code == 200  # 排队真空期同样可暂停
+    assert resp.json()["status"] == "paused"
+
+    resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "resume"})
+    assert resp.status_code == 200
 
     resp = await c.post(f"/api/research/tasks/{task_id}/control", json={"action": "stop"})
     assert resp.status_code == 200
@@ -201,3 +216,43 @@ async def test_create_task_with_budget_override(client: AsyncClient):
         "/api/research/tasks", json={"question": "预算过小", "depth": "quick", "token_budget": 100}
     )
     assert resp.status_code == 422
+
+
+async def test_delete_task_cascades(client: AsyncClient):
+    """终态任务删除：任务与全部关联数据清空；运行中任务 409 拒绝。"""
+    c, _ = client
+    resp = await c.post("/api/research/tasks", json={"question": "待删除任务", "depth": "std"})
+    task_id = resp.json()["id"]
+
+    maker = async_sessionmaker(create_async_engine(TEST_DB_URL), expire_on_commit=False)
+
+    async with maker() as session:
+        session.add(SubTask(task_id=task_id, title="子任务", status=SubTaskStatus.done))
+        session.add(Source(task_id=task_id, url="https://a.com", title="t", domain="a.com"))
+        session.add(Note(task_id=task_id, content="笔记 [1]"))
+        session.add(AgentEvent(task_id=task_id, seq=1, type=EventType.plan, payload={}))
+        task = await session.get(ResearchTask, task_id)
+        task.status = TaskStatus.done
+        await session.commit()
+
+    resp = await c.delete(f"/api/research/tasks/{task_id}")
+    assert resp.status_code == 204
+
+    async with maker() as session:
+        assert await session.get(ResearchTask, task_id) is None
+        for model in (SubTask, Source, Note, AgentEvent):
+            rows = (await session.execute(select(model).where(model.task_id == task_id))).all()
+            assert rows == []
+
+    # 404：不存在
+    resp = await c.delete("/api/research/tasks/999999")
+    assert resp.status_code == 404
+
+    # 409：运行中任务拒绝删除
+    async with maker() as session:
+        task = ResearchTask(question="运行中不可删", status=TaskStatus.running, token_budget=80000)
+        session.add(task)
+        await session.commit()
+        running_id = task.id
+    resp = await c.delete(f"/api/research/tasks/{running_id}")
+    assert resp.status_code == 409

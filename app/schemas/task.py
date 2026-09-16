@@ -128,5 +128,43 @@ class ChatMessageOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class StatsModelUsage(BaseModel):
+    model: str
+    role: str
+    prompt_tokens: int
+    completion_tokens: int
+    tokens: int
+    cost_cny: float
+    calls: int
+
+
+class StatsDailyPoint(BaseModel):
+    date: str
+    cost_cny: float
+    tokens: int
+    by_model: dict[str, float] = {}
+
+
+class StatsTaskPoint(BaseModel):
+    id: int
+    question: str
+    depth: str
+    status: str
+    cost_cny: float
+    token_used: int
+    created_at: str | None
+
+
+class StatsOut(BaseModel):
+    days: int
+    summary: dict
+    cache: dict
+    by_model: list[StatsModelUsage]
+    daily: list[StatsDailyPoint]
+    avg_by_depth: dict
+    tasks: list[StatsTaskPoint]
+    pricing_note: str
+
+
 def now_utc() -> datetime:
     return datetime.now(UTC)

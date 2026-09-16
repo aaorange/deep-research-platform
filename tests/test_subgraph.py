@@ -1,3 +1,5 @@
+import pytest
+
 from app.db import EventType
 from app.engine.schemas import NoteFact, NoteUsage, WorkerNote
 from app.engine.subgraph import WorkerDeps, build_worker_graph
@@ -89,9 +91,13 @@ def make_note(note=None, usage=None, error=None):
     return write_note
 
 
-def make_deps(search, read, note, recorder=None):
+def make_deps(search, read, note, recorder=None, fence=None):
     return WorkerDeps(
-        search=search, read_page=read, write_note=note, recorder=recorder or FakeRecorder()
+        search=search,
+        read_page=read,
+        write_note=note,
+        recorder=recorder or FakeRecorder(),
+        fence=fence,
     )
 
 
@@ -283,6 +289,48 @@ async def test_note_failure_routes_to_end():
     control = [e for e in recorder.events if e["type"] == EventType.control]
     assert control[0]["payload"]["stage"] == "note"
     assert "503" in control[0]["payload"]["error"]
+
+
+async def test_fence_aborts_before_search():
+    """围栏在搜索前触发：任务已终止 → 不发搜索、零事件。"""
+    from app.engine.main_graph import JobSupersededError
+
+    async def fence():
+        raise JobSupersededError("task stopped")
+
+    search = make_search()
+    deps = make_deps(search, make_read(), make_note(), fence=fence)
+    graph = build_worker_graph(deps)
+
+    with pytest.raises(JobSupersededError, match="stopped"):
+        await graph.ainvoke({"task_id": 1, "sub_task_id": 7, "title": "标题"})
+
+    assert search.calls == []  # 搜索未发出
+    assert deps.recorder.events == []  # 零事件落库
+
+
+async def test_fence_aborts_before_note():
+    """围栏在读页后、笔记 LLM 前触发：搜索/读页已发生，笔记不再消耗。"""
+    from app.engine.main_graph import JobSupersededError
+
+    hits = [SearchHit(title="t", url="https://a.com/1", snippet="s")]
+    note = make_note()
+    fence_calls = []
+
+    async def fence():
+        fence_calls.append(1)
+        if len(fence_calls) >= 3:  # search 前 / read 前通过，note 前中止
+            raise JobSupersededError("task stopped")
+
+    deps = make_deps(make_search(hits), make_read(), note, fence=fence)
+    graph = build_worker_graph(deps)
+
+    with pytest.raises(JobSupersededError):
+        await graph.ainvoke({"task_id": 1, "sub_task_id": 7, "title": "标题"})
+
+    assert note.calls == []  # LLM 笔记未发出
+    types = [e["type"] for e in deps.recorder.events]
+    assert EventType.search in types and EventType.fetch in types  # 检索阶段正常完成
 
 
 async def test_max_pages_limit():

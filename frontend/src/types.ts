@@ -105,3 +105,45 @@ export interface AgentEvent {
   latency_ms: number | null;
   created_at: string | null;
 }
+
+export interface StatsModelUsage {
+  model: string;
+  role: string;
+  prompt_tokens: number;
+  completion_tokens: number;
+  tokens: number;
+  cost_cny: number;
+  calls: number;
+}
+
+export interface StatsTaskPoint {
+  id: number;
+  question: string;
+  depth: Depth;
+  status: TaskStatus;
+  cost_cny: number;
+  token_used: number;
+  created_at: string | null;
+}
+
+export interface StatsOut {
+  days: number;
+  summary: {
+    total_cost_cny: number | null;
+    task_count: number | null;
+    total_tokens: number | null;
+    prompt_tokens: number | null;
+    completion_tokens: number | null;
+  };
+  cache: {
+    hit_rate: number | null;
+    cache_hits: number | null;
+    total_calls: number | null;
+    saved_cny: number | null;
+  };
+  by_model: StatsModelUsage[];
+  daily: { date: string; cost_cny: number; tokens: number; by_model: Record<string, number> }[];
+  avg_by_depth: Record<string, { count: number; avg_cost_cny: number }>;
+  tasks: StatsTaskPoint[];
+  pricing_note: string;
+}

@@ -4,6 +4,7 @@ import type {
   Depth,
   ReportOut,
   SourceOut,
+  StatsOut,
   TaskDetail,
   TaskOut,
 } from "./types";
@@ -22,6 +23,13 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
   return resp.json() as Promise<T>;
 }
 
+/** 成本看板（/api/stats 不在 tasks 前缀下，单独请求）。 */
+export const getStats = (days: number) =>
+  fetch(`/api/stats?days=${days}`).then((r) => {
+    if (!r.ok) throw new Error(`${r.status}: ${r.statusText}`);
+    return r.json() as Promise<StatsOut>;
+  });
+
 export const listTasks = () => req<TaskOut[]>("");
 
 export const getTask = (id: number) => req<TaskDetail>(`/${id}`);
@@ -36,6 +44,13 @@ export const controlTask = (id: number, action: "pause" | "resume" | "stop") =>
   req<TaskOut>(`/${id}/control`, {
     method: "POST",
     body: JSON.stringify({ action }),
+  });
+
+/** 删除任务及全部关联数据（运行中/排队/暂停的任务后端 409 拒绝）。 */
+export const deleteTask = (id: number) =>
+  fetch(`${BASE}/${id}`, { method: "DELETE" }).then(async (r) => {
+    if (r.status === 204) return;
+    throw new Error(`${r.status}: ${await r.text()}`);
   });
 
 export const listSources = (id: number) => req<SourceOut[]>(`/${id}/sources`);

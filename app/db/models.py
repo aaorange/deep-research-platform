@@ -47,6 +47,7 @@ class EventType(enum.StrEnum):
     budget = "budget"
     synthesize = "synthesize"
     control = "control"
+    chat = "chat"
 
 
 class ResearchTask(Base):

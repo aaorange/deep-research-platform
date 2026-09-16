@@ -2,15 +2,18 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api";
 import { ActionStream } from "./components/ActionStream";
 import { CostPanel } from "./components/CostPanel";
+import { DepthSelect } from "./components/DepthSelect";
 import { ReportView } from "./components/ReportView";
+import { StatsView } from "./components/StatsView";
 import { StatusBadge, TaskList } from "./components/TaskList";
 import { SourcesPanel } from "./components/SourcesPanel";
 import { SubTaskChecklist } from "./components/SubTaskChecklist";
 import { useTaskStream } from "./useTaskStream";
 import type { Depth, SourceOut, TaskDetail, TaskOut } from "./types";
 
-/** 事件到达后需要刷新详情/信源的事件类型（子任务状态与信源表是 DB 侧落库） */
-const REFRESH_TYPES = new Set(["plan", "note", "budget", "synthesize"]);
+/** 事件到达后需要刷新详情/信源的事件类型（子任务状态与信源表是 DB 侧落库；
+ *  control 含 job 围栏 abort / resume 跳过重规划等控制信号，状态变化需即时反映） */
+const REFRESH_TYPES = new Set(["plan", "note", "budget", "synthesize", "control"]);
 
 export default function App() {
   const [tasks, setTasks] = useState<TaskOut[]>([]);
@@ -21,6 +24,7 @@ export default function App() {
   const [depth, setDepth] = useState<Depth>("std");
   const [creating, setCreating] = useState(false);
   const [showReport, setShowReport] = useState(false);
+  const [showStats, setShowStats] = useState(false);
   const refreshTimer = useRef<number | null>(null);
   // 本次选中期间是否见过运行态：只有「观看中转 done」才自动打开报告，
   // 历史 done 任务选中时 SSE 秒发 end，不应跳页
@@ -91,13 +95,6 @@ export default function App() {
     if (["queued", "running", "paused"].includes(detail?.status ?? "")) sawLiveRef.current = true;
   }, [detail?.status]);
 
-  // SSE 断连兜底：非终态任务每 5s 轮询
-  useEffect(() => {
-    if (selectedId === null || connected || ended) return;
-    const t = window.setInterval(() => loadDetail(selectedId), 5000);
-    return () => window.clearInterval(t);
-  }, [selectedId, connected, ended, loadDetail]);
-
   const createTask = async () => {
     const q = question.trim();
     if (q.length < 2 || creating) return;
@@ -115,17 +112,51 @@ export default function App() {
 
   const control = async (action: "pause" | "resume" | "stop") => {
     if (selectedId === null) return;
-    await api.controlTask(selectedId, action);
-    await loadDetail(selectedId);
-    await loadTasks();
+    try {
+      await api.controlTask(selectedId, action);
+    } catch {
+      /* 状态已变的竞态（如 409）：刷新取真实状态即可 */
+    } finally {
+      await loadDetail(selectedId);
+      await loadTasks();
+    }
+  };
+
+  const removeTask = async (t: TaskOut) => {
+    if (!window.confirm(`删除任务「${t.question.slice(0, 40)}」及其全部数据？不可恢复。`)) return;
+    try {
+      await api.deleteTask(t.id);
+    } catch (e) {
+      window.alert(e instanceof Error ? e.message : "删除失败");
+      return;
+    }
+    const list = await loadTasks();
+    if (selectedId === t.id) {
+      setSelectedId(list.length > 0 ? list[0].id : null);
+      setDetail(null);
+      setSources([]);
+      setShowReport(false);
+    }
   };
 
   const status = detail?.status ?? "queued";
-  const canPause = status === "running";
+  const canPause = status === "running" || status === "queued";
   const canResume = status === "paused" || status === "failed";
   const canStop = ["queued", "running", "paused"].includes(status);
   const canReport = status === "done";
   const doneSubs = detail?.sub_tasks.filter((s) => s.status === "done").length ?? 0;
+
+  // 非终态任务 5s 轮询兜底：queued→running 的翻转不产生 SSE 事件，
+  // SSE 断连/事件间隙（LLM 长调用）也要保持状态与成本新鲜
+  const liveStatus = ["queued", "running", "paused"].includes(status);
+  useEffect(() => {
+    if (selectedId === null || !liveStatus) return;
+    const t = window.setInterval(() => {
+      loadDetail(selectedId);
+      loadTasks();
+    }, 5000);
+    return () => window.clearInterval(t);
+  }, [selectedId, liveStatus, loadDetail, loadTasks]);
 
   return (
     <>
@@ -141,18 +172,29 @@ export default function App() {
             onChange={(e) => setQuestion(e.target.value)}
             onKeyDown={(e) => e.key === "Enter" && createTask()}
           />
-          <select value={depth} onChange={(e) => setDepth(e.target.value as Depth)}>
-            <option value="quick">快速</option>
-            <option value="std">标准</option>
-            <option value="deep">深度</option>
-          </select>
+          <DepthSelect value={depth} onChange={setDepth} />
           <button className="btn primary" onClick={createTask} disabled={creating || question.trim().length < 2}>
             {creating ? "提交中…" : "开始研究"}
           </button>
+          {showStats ? (
+            <button className="btn back-toggle" onClick={() => setShowStats(false)} title="返回研究工作台">
+              ← 返回工作台
+            </button>
+          ) : (
+            <button
+              className="btn stats-toggle"
+              onClick={() => setShowStats(true)}
+              title="成本看板：总成本 / 缓存节省 / 模型拆分 / 趋势"
+            >
+              成本看板
+            </button>
+          )}
         </div>
       </header>
 
-      {showReport && selectedId !== null ? (
+      {showStats ? (
+        <StatsView onBack={() => setShowStats(false)} />
+      ) : showReport && selectedId !== null ? (
         <ReportView taskId={selectedId} onBack={() => setShowReport(false)} />
       ) : (
         <div className="workbench">
@@ -162,7 +204,7 @@ export default function App() {
             <span className="col-count">{tasks.length} 个</span>
           </div>
           <div className="col-body">
-            <TaskList tasks={tasks} selectedId={selectedId} onSelect={setSelectedId} />
+            <TaskList tasks={tasks} selectedId={selectedId} onSelect={setSelectedId} onDelete={removeTask} />
           </div>
           <div className="col-header">
             <span className="col-title">子任务</span>

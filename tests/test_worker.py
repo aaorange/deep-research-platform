@@ -162,7 +162,7 @@ def patch_all(monkeypatch, maker, fail_all=False, reflect=None, crash_ids=frozen
     monkeypatch.setattr(
         orchestrator,
         "make_sub_task_runner",
-        lambda verbose=False: make_fake_worker(maker, fail_all, crash_ids, usage),
+        lambda verbose=False, run_token=None: make_fake_worker(maker, fail_all, crash_ids, usage),
     )
     monkeypatch.setattr(orchestrator, "write_report", fake_report())
     monkeypatch.setattr(orchestrator, "reflect_on_coverage", reflect or fake_reflect())
@@ -284,6 +284,29 @@ async def test_execute_research_resume_after_crash(session_maker, monkeypatch):
         assert task.token_used == 580 + 250 + 2300
 
 
+async def test_execute_research_skips_paused_task(session_maker, monkeypatch):
+    """排队真空期暂停：job 取到任务时状态已 paused，直接退出不置 running、不跑图。"""
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        await session.execute(
+            update(ResearchTask).where(ResearchTask.id == task_id).values(status=TaskStatus.paused)
+        )
+        await session.commit()
+
+    patch_all(monkeypatch, session_maker)
+    result = await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    assert result["status"] == "paused"
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        assert task.status == TaskStatus.paused  # 未被 job 覆盖为 running
+        events = list(
+            await session.scalars(select(AgentEvent).where(AgentEvent.task_id == task_id))
+        )
+        assert events == []  # 图未执行、零事件
+        assert task.token_used == 0
+
+
 async def test_execute_research_budget_degrades(session_maker, monkeypatch):
     """低压预算 e2e：execute 后消耗 80%+ → reflect 跳过 → 报告尾部预算声明。"""
     task_id = await _make_task(session_maker, token_budget=2000)
@@ -402,7 +425,7 @@ def patch_interrupting(monkeypatch, maker, mode):
     monkeypatch.setattr(
         orchestrator,
         "make_sub_task_runner",
-        lambda verbose=False: make_interrupting_worker(maker, mode),
+        lambda verbose=False, run_token=None: make_interrupting_worker(maker, mode),
     )
     monkeypatch.setattr(orchestrator, "write_report", fake_report())
     monkeypatch.setattr(orchestrator, "reflect_on_coverage", fake_reflect())

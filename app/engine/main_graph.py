@@ -275,6 +275,9 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
                 "count": len(sub_tasks),
                 "titles": [st["title"] for st in sub_tasks],
                 "fallback": fallback,
+                "model": get_settings().llm_model_chat,
+                "prompt_tokens": usage.prompt_tokens if usage else None,
+                "completion_tokens": usage.completion_tokens if usage else None,
             },
             tokens=tokens or None,
         )
@@ -459,6 +462,9 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
                 "instructions": len(instructions),
                 "created": len(created),
                 "next_round": round_no if created else None,
+                "model": get_settings().llm_model_chat if usage else None,
+                "prompt_tokens": usage.prompt_tokens if usage else None,
+                "completion_tokens": usage.completion_tokens if usage else None,
             },
             tokens=usage.total_tokens if usage else None,
         )
@@ -548,6 +554,9 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
                 "notes": len(notes),
                 "sources": len(sources),
                 "budget_degraded": degraded,
+                "model": get_settings().llm_model_reasoner if usage else None,
+                "prompt_tokens": usage.prompt_tokens if usage else None,
+                "completion_tokens": usage.completion_tokens if usage else None,
             },
             tokens=usage.total_tokens if usage else None,
         )

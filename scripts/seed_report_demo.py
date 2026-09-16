@@ -1,18 +1,37 @@
-"""演示数据：造一个已完成任务（子任务/信源/笔记/报告），供报告阅读页验收。
+"""演示数据：造一个已完成任务（子任务/信源/笔记/报告/事件流/追问）。
 
 数据形态与引擎真实落库一致：笔记正文的 [N] 锚点是信源库 id（persister
 重写后的格式），报告 markdown 的 [N] 是展示编号，二者通过 citation_map
-映射。运行：uv run python scripts/seed_report_demo.py
+映射。agent_events 覆盖 plan/search/fetch/degrade/note/reflect/synthesize/
+budget/chat 全链路：LLM 事件带 model/prompt/completion 计费拆分，检索与
+读页事件含 cache 命中，task 的 token_used / cost_cny 由事件推算，保证成
+本看板对账一致。运行：uv run python scripts/seed_report_demo.py
 """
 
 import asyncio
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.db import Note, Report, ResearchTask, Source, SubTask, SubTaskStatus, TaskStatus
+from app.config import get_settings
+from app.db import (
+    AgentEvent,
+    ChatMessage,
+    ChatRole,
+    EventType,
+    Note,
+    Report,
+    ResearchTask,
+    Source,
+    SubTask,
+    SubTaskStatus,
+    TaskStatus,
+)
 from app.db.base import SessionLocal
+from app.engine.budget import budget_payload
+from app.engine.persister import cost_cny
 
 SUBS = [
     "医疗大模型监管政策与三类证审批进展",
@@ -21,6 +40,16 @@ SUBS = [
     "药企研发与蛋白质结构预测应用",
     "医疗大模型市场格局与商业化模式",
     "数据合规与医疗隐私计算挑战",
+]
+SUB_R2 = "欧盟 MDR 与中国 NMPA 的 AI 医疗器械审批路径对比"
+
+KEYWORDS = [
+    "AI 辅助诊断 三类证 审批通道",
+    "医学影像 大模型 三甲医院 采购",
+    "临床决策支持 电子病历 质控",
+    "蛋白质结构预测 大模型 药企",
+    "医疗大模型 市场规模 商业化模式",
+    "医疗数据合规 隐私计算 分类分级",
 ]
 
 SOURCES = [
@@ -89,6 +118,7 @@ NOTES = {
     3: "药企侧蛋白质结构预测引入国产大模型后，部分靶点筛选周期从 6 周缩短到 9 天，但晶型预测的准确率仍低于国际闭源方案[{{s5}}]。国内已有 14 家创新药企公开确认采购相关服务[{{s5}}]。",
     4: "2025 年中国医疗大模型市场规模预计 82 亿元，头部厂商合计份额接近七成，商业模式以「按年订阅 + 调用计费」混合为主[{{s4}}]。医院端付费意愿显著分化，三级医院贡献了约 75% 的收入[{{s4}}]。",
     5: "医疗数据合规是最大落地摩擦：训练数据需完成脱敏与授权双链条，跨院数据流通依赖隐私计算平台[{{s6}}]。国家层面已明确健康医疗数据的分类分级管理要求，院内数据出域仍受严格限制[{{s7}}]。",
+    6: "欧盟 MDR 将 AI 医疗器械纳入全生命周期证据链管理，与 NMPA 的优先审批通道相比，欧盟路径平均多 4-6 个月但临床证据要求更前置[{{s0}}]。境外厂商进入中国同样必须取得 NMPA 三类证，进口产品可走优先审批通道[{{s1}}]。多国对照显示，中国的审批提速幅度最大[{{s7}}]。",
 }
 
 REPORT = """# 2025 年国产大模型在医疗行业的落地情况
@@ -126,7 +156,7 @@ REPORT = """# 2025 年国产大模型在医疗行业的落地情况
 
 ## 三、市场格局：七成份额与两级分化
 
-2025 年中国医疗大模型市场规模预计 82 亿元，头部厂商合计份额接近七成，商业模式以「按年订阅 + 调用计费」混合为主[5]。付费意愿两级分化明显：三级医院贡献约 75% 的收入，基层机构仍以财政项目制为主[5]。
+2025 年中国医疗大模型市场规模预计 82 亿元，头部厂商合计份额接近七成，商业模式以「按年订阅 + 调用计费」混合为主[5]。付费意愿显著分化：三级医院贡献约 75% 的收入，基层机构仍以试点为主[5]。
 
 <!-- chart:c3 -->
 
@@ -163,16 +193,96 @@ CHARTS = [
     },
 ]
 
+# 每个子任务成功读取的信源（下标, provider）：跨子任务重读同 URL 走页面缓存
+FETCH_PLAN = [
+    [(0, "jina"), (1, "jina"), (7, "jina")],
+    [(2, "jina")],
+    [(3, "crawl4ai")],
+    [(5, "jina"), (7, "cache")],
+    [(4, "jina"), (1, "cache")],
+    [(6, "jina"), (7, "cache")],
+    [(0, "cache"), (1, "cache")],  # R2 补搜：重读监管信源
+]
+
+FETCH_CHARS = [9200, 6800, 5400, 7100, 8300, 4900, 6200, 5800]
+
+# LLM 计费拆分（prompt, completion）：tokens = 两者之和
+PLAN_USAGE = (3240, 720)
+NOTE_USAGE = (3600, 780)
+NOTE_R2_USAGE = (3200, 690)
+REFLECT_USAGE = (4100, 360)
+REFLECT_R2_USAGE = (3800, 310)
+SYNTH_USAGE = (8200, 9864)
+CHAT_USAGE = (2050, 520)
+
+BUDGET = 80_000
+
+
+class EventLog:
+    """按工作流顺序分配 seq，统一推进时间线，并累计计费口径。"""
+
+    def __init__(self, task_id: int, t0: datetime, model_chat: str, model_reasoner: str):
+        self.task_id = task_id
+        self.t0 = t0
+        self.model_chat = model_chat
+        self.model_reasoner = model_reasoner
+        self.seq = 0
+        self.events: list[AgentEvent] = []
+        self.usage: list[tuple[str, int, int]] = []
+
+    def add(self, minutes: float, ev_type: EventType, payload: dict, **kw) -> None:
+        self.seq += 1
+        self.events.append(
+            AgentEvent(
+                task_id=self.task_id,
+                seq=self.seq,
+                type=ev_type,
+                payload=payload,
+                created_at=self.t0 + timedelta(minutes=minutes),
+                **kw,
+            )
+        )
+
+    def llm(
+        self,
+        minutes: float,
+        ev_type: EventType,
+        usage: tuple[int, int],
+        reasoner: bool,
+        payload: dict,
+        **kw,
+    ) -> None:
+        model = self.model_reasoner if reasoner else self.model_chat
+        prompt, completion = usage
+        self.add(
+            minutes,
+            ev_type,
+            {**payload, "model": model, "prompt_tokens": prompt, "completion_tokens": completion},
+            tokens=prompt + completion,
+            **kw,
+        )
+        self.usage.append((model, prompt, completion))
+
+    def commit(self, session) -> None:
+        session.add_all(self.events)
+
+    def token_used(self) -> int:
+        return sum(p + c for _, p, c in self.usage)
+
+    def cost_cny(self) -> float:
+        return round(sum(cost_cny(m, p, c) for m, p, c in self.usage), 2)
+
 
 async def main() -> None:
+    settings = get_settings()
+    t0 = datetime.now(UTC) - timedelta(hours=6)
+
     async with SessionLocal() as session:
         task = ResearchTask(
             question="2025 年国产大模型在医疗行业的落地情况",
             status=TaskStatus.done,
             depth="std",
-            token_budget=80_000,
-            token_used=52_318,
-            cost_cny=0.47,
+            token_budget=BUDGET,
         )
         session.add(task)
         await session.flush()
@@ -183,6 +293,10 @@ async def main() -> None:
             session.add(sub)
             await session.flush()
             sub_ids.append(sub.id)
+        r2 = SubTask(task_id=task.id, title=SUB_R2, status=SubTaskStatus.done, round_no=2)
+        session.add(r2)
+        await session.flush()
+        sub_ids.append(r2.id)
 
         src_ids = []
         for url, title, domain, cred, fresh in SOURCES:
@@ -204,18 +318,230 @@ async def main() -> None:
             session.add(Note(task_id=task.id, sub_task_id=sub_ids[i], content=content))
 
         citation_map = {str(i + 1): src_ids[i] for i in range(len(src_ids))}
-        session.add(
-            Report(
-                task_id=task.id,
-                version=1,
-                markdown=REPORT,
-                citation_map=citation_map,
-                chart_specs=CHARTS,
-                token_total=9_864,
-            )
+        report = Report(
+            task_id=task.id,
+            version=1,
+            markdown=REPORT,
+            citation_map=citation_map,
+            chart_specs=CHARTS,
+            token_total=SYNTH_USAGE[1],
         )
+        session.add(report)
+        await session.flush()
+
+        log = EventLog(task.id, t0, settings.llm_model_chat, settings.llm_model_reasoner)
+
+        log.llm(
+            0.0,
+            EventType.plan,
+            PLAN_USAGE,
+            reasoner=False,
+            payload={
+                "depth": "std",
+                "count": len(SUBS),
+                "titles": SUBS,
+                "fallback": False,
+            },
+        )
+        log.add(
+            0.2, EventType.budget, budget_payload("plan", PLAN_USAGE[0] + PLAN_USAGE[1], BUDGET)
+        )
+
+        for i, (_title, keywords) in enumerate(zip(SUBS, KEYWORDS, strict=True)):
+            base = 1.0 + i * 4.0
+            log.add(
+                base,
+                EventType.search,
+                {
+                    "query": keywords,
+                    "provider": "bocha",
+                    "hits": 8,
+                    "titles": [SOURCES[j][1] for j in (i, (i + 1) % 8, (i + 2) % 8)][:3],
+                },
+                sub_task_id=sub_ids[i],
+                latency_ms=420 + i * 55,
+            )
+            if i == 2:  # 机器之心页面反爬，jina 降级到 crawl4ai 后成功
+                log.add(
+                    base + 0.3,
+                    EventType.degrade,
+                    {
+                        "from": "jina",
+                        "to": "crawl4ai",
+                        "error": "jina: content too short (84 chars)",
+                        "url": SOURCES[3][0],
+                    },
+                    sub_task_id=sub_ids[i],
+                )
+            for k, (src_idx, provider) in enumerate(FETCH_PLAN[i]):
+                url, title_s, domain, cred, _ = SOURCES[src_idx]
+                latency = 3100 if provider == "crawl4ai" else 900 + k * 350
+                log.add(
+                    base + 0.4 + k * 0.5,
+                    EventType.fetch,
+                    {
+                        "url": url,
+                        "provider": provider,
+                        "title": title_s,
+                        "chars": FETCH_CHARS[src_idx],
+                        "latency_ms": latency,
+                        "domain": domain,
+                        "credibility": cred,
+                    },
+                    sub_task_id=sub_ids[i],
+                    latency_ms=latency,
+                )
+            log.llm(
+                base + 3.0,
+                EventType.note,
+                NOTE_USAGE,
+                reasoner=False,
+                payload={
+                    "summary_chars": 240 + i * 15,
+                    "facts": 6,
+                    "gaps": [],
+                    "sources_used": len(FETCH_PLAN[i]),
+                },
+                sub_task_id=sub_ids[i],
+            )
+
+        log.llm(
+            25.0,
+            EventType.reflect,
+            REFLECT_USAGE,
+            reasoner=False,
+            payload={
+                "round": 1,
+                "assessment": "六大主线素材完整，但监管章节缺少欧盟 MDR 对照视角，无法回答跨境审批差异问题",
+                "has_gaps": True,
+                "gap_titles": [SUB_R2],
+                "instructions": 0,
+                "created": 1,
+                "next_round": 2,
+            },
+        )
+
+        # ---- R2 补搜：关键词与 R1 监管子任务相同 → 搜索命中缓存，页面重读走缓存 ----
+        log.add(
+            26.0,
+            EventType.search,
+            {
+                "query": KEYWORDS[0],
+                "provider": "cache",
+                "hits": 8,
+                "titles": [SOURCES[0][1], SOURCES[1][1], SOURCES[7][1]],
+            },
+            sub_task_id=sub_ids[6],
+            latency_ms=35,
+        )
+        for k, (src_idx, provider) in enumerate(FETCH_PLAN[6]):
+            url, title_s, domain, cred, _ = SOURCES[src_idx]
+            log.add(
+                26.4 + k * 0.5,
+                EventType.fetch,
+                {
+                    "url": url,
+                    "provider": provider,
+                    "title": title_s,
+                    "chars": FETCH_CHARS[src_idx],
+                    "latency_ms": 120 + k * 40,
+                    "domain": domain,
+                    "credibility": cred,
+                },
+                sub_task_id=sub_ids[6],
+                latency_ms=120 + k * 40,
+            )
+        log.llm(
+            29.0,
+            EventType.note,
+            NOTE_R2_USAGE,
+            reasoner=False,
+            payload={
+                "summary_chars": 330,
+                "facts": 6,
+                "gaps": [],
+                "sources_used": len(FETCH_PLAN[6]),
+            },
+            sub_task_id=sub_ids[6],
+        )
+
+        log.llm(
+            30.0,
+            EventType.reflect,
+            REFLECT_R2_USAGE,
+            reasoner=False,
+            payload={
+                "round": 2,
+                "assessment": "补充任务已完成监管对照素材，信息密度足够进入综合阶段",
+                "has_gaps": False,
+                "gap_titles": [],
+                "instructions": 0,
+                "created": 0,
+                "next_round": None,
+            },
+        )
+
+        log.llm(
+            33.0,
+            EventType.synthesize,
+            SYNTH_USAGE,
+            reasoner=True,
+            payload={
+                "report_id": report.id,
+                "chars": len(REPORT),
+                "citations": len(src_ids),
+                "notes": len(NOTES),
+                "sources": len(src_ids),
+                "budget_degraded": False,
+            },
+        )
+        log.add(33.2, EventType.budget, budget_payload("synthesize", log.token_used(), BUDGET))
+
+        user_q = "海外医疗器械厂商的 AI 诊断产品进入中国，也要重新走三类证审批吗？"
+        assistant_a = (
+            f"需要。境外厂商的 AI 诊断软件同样必须取得 NMPA 三类证方可在中国上市销售，"
+            f"监管要求与本土产品一致[{src_ids[0]}]。区别在于：进口产品可以申请优先审批通道，"
+            f"但需额外提交原产国上市证明与境内临床评价资料，整体周期通常比本土厂商多 2-3 个月[{src_ids[1]}]。"
+        )
+        user_msg = ChatMessage(
+            task_id=task.id,
+            role=ChatRole.user,
+            content=user_q,
+            created_at=t0 + timedelta(minutes=50.0),
+        )
+        session.add(user_msg)
+        await session.flush()
+        assistant_msg = ChatMessage(
+            task_id=task.id,
+            role=ChatRole.assistant,
+            content=assistant_a,
+            cited_source_ids=[src_ids[0], src_ids[1]],
+            created_at=t0 + timedelta(minutes=50.2),
+        )
+        session.add(assistant_msg)
+        await session.flush()
+        log.llm(
+            50.2,
+            EventType.chat,
+            CHAT_USAGE,
+            reasoner=False,
+            payload={
+                "message_id": assistant_msg.id,
+                "question_chars": len(user_q),
+                "answer_chars": len(assistant_a),
+                "cited": 2,
+            },
+        )
+
+        log.commit(session)
+
+        task.token_used = log.token_used()
+        task.cost_cny = log.cost_cny()
         await session.commit()
-        print(f"seeded done-task id={task.id} with {len(src_ids)} sources, {len(CHARTS)} charts")
+        print(
+            f"seeded done-task id={task.id}: {len(src_ids)} sources, {len(CHARTS)} charts, "
+            f"{log.seq} events, tokens={task.token_used}, cost=¥{task.cost_cny}"
+        )
 
 
 if __name__ == "__main__":

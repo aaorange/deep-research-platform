@@ -3,11 +3,22 @@ import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.db import AgentEvent, ChatMessage, ChatRole, Note, Report, ResearchTask, Source, TaskStatus
+from app.db import (
+    AgentEvent,
+    ChatMessage,
+    ChatRole,
+    EventType,
+    Note,
+    Report,
+    ResearchTask,
+    Source,
+    SubTask,
+    TaskStatus,
+)
 from app.db.base import get_session
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import DEPTH_BUDGETS
@@ -28,6 +39,7 @@ from app.schemas.task import (
 )
 from app.services import event_bus
 from app.services.chat import write_chat_reply
+from app.services.event_recorder import EventRecorder
 from app.services.excerpt import extract_excerpts
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
@@ -130,6 +142,9 @@ async def control_task(
         raise HTTPException(status_code=404, detail="task not found")
 
     transitions: dict[tuple[TaskStatus, str], TaskStatus] = {
+        # queued 也允许暂停：排队真空期（worker 尚未取走）用户同样需要暂停；
+        # job 取走时 execute_research 启动拦截会直接退出
+        (TaskStatus.queued, "pause"): TaskStatus.paused,
         (TaskStatus.running, "pause"): TaskStatus.paused,
         # resume → queued 并重新入队：worker 崩溃/被 kill 后残留的 running、
         # paused、failed 均可续跑（子任务级幂等保证不重复消耗）
@@ -152,6 +167,28 @@ async def control_task(
         await enqueue_research(queue, task_id)
     await session.refresh(task)
     return task
+
+
+@router.delete("/{task_id}", status_code=204)
+async def delete_task(task_id: int, session: AsyncSession = Depends(get_session)) -> None:
+    """删除任务及全部关联数据（子任务/信源/笔记/报告/事件/追问）。
+
+    运行中/排队/暂停的任务拒绝删除（数据会被 job 继续写回），先终止再删。
+    外键无级联，按依赖序显式清理。
+    """
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    if task.status in (TaskStatus.queued, TaskStatus.running, TaskStatus.paused):
+        raise HTTPException(
+            status_code=409,
+            detail=f"task is '{task.status.value}' — stop it before deleting",
+        )
+
+    for model in (ChatMessage, Note, Report, AgentEvent, Source, SubTask):
+        await session.execute(delete(model).where(model.task_id == task_id))
+    await session.delete(task)
+    await session.commit()
 
 
 @router.get("/{task_id}/sources", response_model=list[SourceOut])
@@ -322,6 +359,22 @@ async def send_chat(
     else:
         await session.commit()
     await session.refresh(assistant)
+    # 计费事件：成本看板以 agent_events 聚合为对账基准，追问消耗必须入账
+    recorder = EventRecorder(session)
+    await recorder.record(
+        task_id,
+        EventType.chat,
+        {
+            "message_id": assistant.id,
+            "question_chars": len(body.text),
+            "answer_chars": len(reply.answer),
+            "cited": len(reply.cited_ids),
+            "model": get_settings().llm_model_chat if usage is not None else None,
+            "prompt_tokens": usage.prompt_tokens if usage is not None else None,
+            "completion_tokens": usage.completion_tokens if usage is not None else None,
+        },
+        tokens=usage.total_tokens if usage is not None else None,
+    )
     return assistant
 
 

@@ -368,6 +368,9 @@ async def test_full_flow_plan_execute_reflect_synthesize():
         "notes": 5,
         "sources": 5,
         "budget_degraded": False,
+        "model": get_settings().llm_model_reasoner,
+        "prompt_tokens": 800,
+        "completion_tokens": 1500,
     }
     assert syn_ev["tokens"] == 2300
     # budget 事件带配额对照（budget=0 不限额 → quota 0、不降级）

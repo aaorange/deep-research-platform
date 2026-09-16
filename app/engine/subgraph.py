@@ -69,6 +69,12 @@ class CriticalError(Exception):
     """进程级/基础设施错误（DB 断连、OOM 等）：节点不吞，向上抛出以便检查点恢复。"""
 
 
+class FenceFn(Protocol):
+    """子任务内部围栏：任务被终止/暂停/抢占时抛 JobSupersededError 快速退出。"""
+
+    async def __call__(self) -> None: ...
+
+
 class RecorderProtocol(Protocol):
     async def record(
         self,
@@ -105,6 +111,7 @@ class WorkerDeps:
     write_note: NoteFn
     recorder: RecorderProtocol
     persister: PersisterProtocol | None = None  # None = 不落库（纯测试）
+    fence: FenceFn | None = None  # None = 不检查（纯测试）
 
 
 def _content_hash(text: str) -> str:
@@ -112,10 +119,15 @@ def _content_hash(text: str) -> str:
 
 
 def build_worker_graph(deps: WorkerDeps, checkpointer=None):
+    async def fence() -> None:
+        if deps.fence is not None:
+            await deps.fence()
+
     async def search_node(state: WorkerState) -> dict:
         task_id = state["task_id"]
         sub_task_id = state.get("sub_task_id")
         query = state.get("keywords") or state["title"]
+        await fence()
         try:
             result = await deps.search(query, DEFAULT_SEARCH_COUNT)
         except Exception as e:  # noqa: BLE001
@@ -158,6 +170,7 @@ def build_worker_graph(deps: WorkerDeps, checkpointer=None):
     async def read_node(state: WorkerState) -> dict:
         task_id = state["task_id"]
         sub_task_id = state.get("sub_task_id")
+        await fence()
         hits = state["hits"][: state.get("max_pages", DEFAULT_MAX_PAGES)]
         # AsyncSession 禁止并发写；先在协程内收集事件，读完串行落库
         pending_events: list[tuple[EventType, dict, int | None]] = []
@@ -261,6 +274,7 @@ def build_worker_graph(deps: WorkerDeps, checkpointer=None):
     async def note_node(state: WorkerState) -> dict:
         task_id = state["task_id"]
         sub_task_id = state.get("sub_task_id")
+        await fence()
         try:
             note, usage = await deps.write_note(state["title"], state["pages"])
         except CriticalError:
@@ -285,6 +299,9 @@ def build_worker_graph(deps: WorkerDeps, checkpointer=None):
                 "facts": len(note.facts),
                 "gaps": note.gaps,
                 "sources_used": len(state["pages"]),
+                "model": get_settings().llm_model_chat if usage is not None else None,
+                "prompt_tokens": usage.prompt_tokens if usage is not None else None,
+                "completion_tokens": usage.completion_tokens if usage is not None else None,
             },
             sub_task_id=sub_task_id,
             tokens=tokens,
