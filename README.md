@@ -31,42 +31,33 @@
 
 ## 系统架构
 
-```mermaid
-flowchart TB
-    subgraph FE["前端 React 18 + Vite + TS"]
-        WorkBench["三栏工作台<br/>任务清单 / 子任务打勾 / 动作流 SSE / 成本计数"]
-        ReportView["报告阅读页<br/>引用锚定高亮 / ECharts 图表 / 追问对话"]
-        Stats["成本看板"]
-    end
+```text
+      ┌────────────────────────────────────┐
+      │          React (frontend)          │
+      │ 三栏工作台 / 报告阅读页 / 成本看板 │
+      └─────────────────┬──────────────────┘
+                        │ /api (REST + SSE)
+                        ▼
+┌────────────────────────────────────────────────┐      ┌───────────────────┐
+│               FastAPI (backend)                │─────▶│      Redis 7      │
+│      任务 / 报告 / 统计 API / SSE 事件流       │      │ 队列/缓存/pub-sub │
+│                                                │      │ SSE pub-sub 推送  │
+│ ┌──────────── LangGraph 研究引擎 ────────────┐ │      ┌───────────────────┐
+│ │  主图  plan → execute 并行 fan-out(5 并发) │ │─────▶│   DeepSeek API    │
+│ │  反思  reflect 缺口回环(2 轮) → 报告综合   │ │      │  chat / reasoner  │
+│ │  子图  search → read(三级降级) → note      │ │      └───────────────────┘
+│ └────────────────────────────────────────────┘ │
+│                                                │
+└──────────────────────────┴─────────────────────┘
+                           │
+       ┌───────────────────┼────────────────────────┐
+       ▼                   ▼                        ▼
+┌──────────────┐ ┌────────────────────┐ ┌────────────────────────┐
+│  PostgreSQL  │ │     博查 → DDG     │ │    Jina → crawl4ai     │
+│业务表+检查点 │ │     搜索双通道     │ │  trafilatura 三级降级  │
+└──────────────┘ └────────────────────┘ └────────────────────────┘
 
-    subgraph BE["后端 FastAPI"]
-        API["REST API<br/>任务 / 信源 / 报告 / 统计"]
-        SSE["SSE 事件流"]
-    end
-
-    Q[["arq 任务队列"]]
-
-    subgraph ENGINE["研究引擎 LangGraph"]
-        direction TB
-        PLAN["plan 规划<br/>大纲拆解"] --> EXEC["execute<br/>并行 fan-out ≤5 并发"]
-        EXEC --> REFLECT["reflect 反思<br/>覆盖评估 + 缺口补搜"]
-        REFLECT -- "有缺口 ≤2 轮" --> EXEC
-        REFLECT -- "覆盖充分" --> SYNTH["synthesize 综合<br/>带引用报告 + 图表"]
-        SUB["子任务子图：search → read → note"]
-        EXEC -. fan-out .-> SUB
-    end
-
-    PG[("PostgreSQL<br/>业务表 + LangGraph 检查点")]
-    REDIS[("Redis<br/>结果缓存 / 队列 / pub-sub")]
-    LLM["DeepSeek<br/>chat / reasoner"]
-
-    FE --> API
-    SSE --> FE
-    API --> Q --> ENGINE
-    ENGINE --> PG
-    ENGINE --> LLM
-    SUB --> REDIS
-    SSE --- REDIS
+      （研究引擎由 arq worker 独立进程执行，经 Redis 队列与 FastAPI 解耦）
 ```
 
 **模型分工**：deepseek-chat 负责规划、笔记压缩与反思（快、便宜）；deepseek-reasoner 负责最终报告综合（推理质量优先）。
