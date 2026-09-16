@@ -25,39 +25,45 @@ export function CostPanel({
   );
 
   useEffect(() => {
-    if (used > prevUsed.current) {
-      setFlash(true);
-      const t = setTimeout(() => setFlash(false), 800);
-      return () => clearTimeout(t);
-    }
+    if (used === prevUsed.current) return;
+    const up = used > prevUsed.current;
     prevUsed.current = used;
+    if (!up) return;
+    setFlash(true);
+    const t = setTimeout(() => setFlash(false), 700);
+    return () => clearTimeout(t);
   }, [used]);
 
   const pct = budget > 0 ? Math.min(100, (used / budget) * 100) : 0;
   const meterCls = pct >= 80 ? "over" : pct >= 60 ? "warn" : "";
 
   return (
-    <div className="cost-panel">
-      <div className="cost-row">
-        <span>成本</span>
-        <span>¥ {(detail?.cost_cny ?? 0).toFixed(2)}</span>
+    <div className="cost">
+      <div className="lbl">
+        <span>Token 消耗</span>
+        <span>预算 {budget.toLocaleString()}</span>
       </div>
-      <div className={`cost-num ${flash ? "flash" : ""}`}>{used.toLocaleString()}</div>
-      <div className="cost-row" style={{ color: "var(--text-dim)" }}>
-        <span>tokens</span>
-        <span>/ {budget.toLocaleString()}</span>
+      <div className={`num ${flash ? "flash" : ""}`}>
+        {used.toLocaleString()}
+        <small>tokens</small>
       </div>
       <div className="meter">
-        <div className={`meter-fill ${meterCls}`} style={{ width: `${pct}%` }} />
-        <div className="meter-threshold" title="80% 降级阈值" />
+        <div className={`fill ${meterCls}`} style={{ width: `${pct}%` }} />
+        <div className="th" />
+        <span className="cap">80%</span>
       </div>
-      {degraded ? (
-        <div className="degrade-note">⚠ 已触发预算降级（80% 阈值）</div>
-      ) : (
-        <div style={{ fontSize: 11, color: "var(--text-dim)" }}>
-          ｜ 80% 降级线 · {pct.toFixed(0)}%
-        </div>
-      )}
+      <div className="sub-l">
+        {budget === 0 ? (
+          <span>无预算限制</span>
+        ) : degraded ? (
+          <span className="degrade-note">⚠ 已触发预算降级</span>
+        ) : (
+          <span>
+            {pct.toFixed(0)}% · 距降级线 {Math.max(0, 80 - pct).toFixed(0)}%
+          </span>
+        )}
+        <b>¥ {(detail?.cost_cny ?? 0).toFixed(2)}</b>
+      </div>
     </div>
   );
 }

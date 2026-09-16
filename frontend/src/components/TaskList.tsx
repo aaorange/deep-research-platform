@@ -1,7 +1,12 @@
 import type { TaskOut } from "../types";
 
 export function StatusBadge({ status }: { status: string }) {
-  return <span className={`badge ${status}`}>{status}</span>;
+  return (
+    <span className={`st ${status}`}>
+      <i />
+      {status}
+    </span>
+  );
 }
 
 export function TaskList({
@@ -21,17 +26,16 @@ export function TaskList({
       {tasks.map((t) => (
         <div
           key={t.id}
-          className={`task-item ${t.id === selectedId ? "active" : ""}`}
+          className={`task ${t.id === selectedId ? "on" : ""}`}
           onClick={() => onSelect(t.id)}
         >
           <div className="q" title={t.question}>
             {t.question}
           </div>
-          <div className="meta">
-            <span>#{t.id}</span>
+          <div className="m">
             <StatusBadge status={t.status} />
             <span>{t.depth}</span>
-            <span>{t.cost_cny.toFixed(2)} 元</span>
+            <span>¥ {t.cost_cny.toFixed(2)}</span>
           </div>
         </div>
       ))}

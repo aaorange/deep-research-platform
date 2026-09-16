@@ -80,18 +80,18 @@ export function ActionStream({ events }: { events: AgentEvent[] }) {
   return (
     <div className="stream">
       {events.map((ev) => (
-        <div key={ev.seq} className={`event-row ${ev.type}`}>
-          <span className="t">{fmtTime(ev.created_at)}</span>
-          <span className={`et ${ev.type}`}>{TYPE_LABEL[ev.type] ?? ev.type}</span>
-          <span className="desc" title={eventDesc(ev)}>
+        <div key={ev.seq} className={`ev ${ev.type}`}>
+          <span className="time">{fmtTime(ev.created_at)}</span>
+          <span className={`tag ${ev.type}`}>{TYPE_LABEL[ev.type] ?? ev.type}</span>
+          <span className="d" title={eventDesc(ev)}>
             {eventDesc(ev)}
           </span>
           {ev.tokens ? (
-            <span className="tok" title="本次 LLM 调用 token">
-              +{ev.tokens.toLocaleString()}tok
+            <span className="x" title="本次 LLM 调用 token">
+              +{ev.tokens.toLocaleString()}
             </span>
           ) : null}
-          {ev.latency_ms ? <span className="tok">{(ev.latency_ms / 1000).toFixed(1)}s</span> : null}
+          {ev.latency_ms ? <span className="x">{(ev.latency_ms / 1000).toFixed(1)}s</span> : null}
         </div>
       ))}
       <div ref={bottomRef} />

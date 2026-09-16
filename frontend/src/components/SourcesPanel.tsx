@@ -1,8 +1,10 @@
 import type { SourceOut } from "../types";
 
-function stars(n: number | null): string {
+function chipCls(n: number | null): string {
   if (n == null) return "";
-  return "★".repeat(n) + "☆".repeat(5 - n);
+  if (n >= 4) return "c4";
+  if (n >= 3) return "c3";
+  return "";
 }
 
 export function SourcesPanel({ sources }: { sources: SourceOut[] }) {
@@ -12,19 +14,22 @@ export function SourcesPanel({ sources }: { sources: SourceOut[] }) {
   return (
     <>
       {sources.map((s) => (
-        <div key={s.id} className="source-card">
-          <div className="s-title">{s.title ?? "(无标题)"}</div>
-          <div className="s-meta">
-            <span>{s.domain}</span>
-            <span className="stars" title={`可信度 ${s.credibility ?? "-"}/5`}>
-              {stars(s.credibility)}
-            </span>
-          </div>
-          <div className="s-meta">
+        <div key={s.id} className="src">
+          <div className="t">{s.title ?? "(无标题)"}</div>
+          <div className="row">
             <a href={s.url} target="_blank" rel="noreferrer">
               {s.url}
             </a>
-            {s.freshness != null ? <span>新鲜 {(s.freshness * 100).toFixed(0)}%</span> : null}
+            <span className={`chip ${chipCls(s.credibility)}`}>
+              <i />
+              {s.credibility != null ? `${s.credibility}/5` : "未评"}
+            </span>
+          </div>
+          <div className="row">
+            <span>{s.domain}</span>
+            {s.freshness != null ? (
+              <span className="fresh">新鲜 {(s.freshness * 100).toFixed(0)}%</span>
+            ) : null}
           </div>
         </div>
       ))}

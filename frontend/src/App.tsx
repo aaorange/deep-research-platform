@@ -141,15 +141,15 @@ export default function App() {
       <div className="workbench">
         <div className="column">
           <div className="col-header">
-            <span>任务清单</span>
-            <span>{tasks.length} 个</span>
+            <span className="col-title">任务清单</span>
+            <span className="col-count">{tasks.length} 个</span>
           </div>
           <div className="col-body">
             <TaskList tasks={tasks} selectedId={selectedId} onSelect={setSelectedId} />
           </div>
           <div className="col-header">
-            <span>子任务</span>
-            <span>
+            <span className="col-title">子任务</span>
+            <span className="col-count">
               {detail ? `${doneSubs}/${detail.sub_tasks.length}` : "-"}
             </span>
           </div>
@@ -162,11 +162,11 @@ export default function App() {
           <div className="col-header">
             <div className="stream-toolbar">
               <span className={`conn-dot ${connected ? "on" : ""}`} title={connected ? "SSE 已连接" : "SSE 断开（自动重连中）"} />
-              <span>动作流</span>
-              <span style={{ color: "var(--text-dim)" }}>{events.length} 条</span>
+              <span className="col-title">动作流</span>
+              <span className="col-count">{events.length} 条</span>
             </div>
             {detail ? (
-              <>
+              <div className="ctrl">
                 <StatusBadge status={status} />
                 {canPause && (
                   <button className="btn warn" onClick={() => control("pause")}>
@@ -183,7 +183,7 @@ export default function App() {
                     ⏹ 终止
                   </button>
                 )}
-              </>
+              </div>
             ) : null}
           </div>
           <div className="col-body">
@@ -193,8 +193,8 @@ export default function App() {
 
         <div className="column">
           <div className="col-header">
-            <span>信源与成本</span>
-            <span>{sources.length} 个信源</span>
+            <span className="col-title">信源与成本</span>
+            <span className="col-count">{sources.length} 个信源</span>
           </div>
           <CostPanel detail={detail} events={events} />
           <div className="col-body">
