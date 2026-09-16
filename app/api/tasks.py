@@ -6,7 +6,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db import AgentEvent, ResearchTask, Source, TaskStatus
+from app.db import AgentEvent, Note, Report, ResearchTask, Source, TaskStatus
 from app.db.base import get_session
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import DEPTH_BUDGETS
@@ -15,6 +15,8 @@ from app.schemas.task import (
     EventOut,
     InstructionCreate,
     InstructionOut,
+    ReportOut,
+    ReportSourceOut,
     SourceOut,
     TaskControl,
     TaskCreate,
@@ -22,6 +24,7 @@ from app.schemas.task import (
     TaskOut,
 )
 from app.services import event_bus
+from app.services.excerpt import extract_excerpts
 
 router = APIRouter(prefix="/research/tasks", tags=["research"])
 
@@ -157,6 +160,79 @@ async def list_sources(task_id: int, session: AsyncSession = Depends(get_session
         select(Source).where(Source.task_id == task_id).order_by(Source.id)
     )
     return list(result.scalars().all())
+
+
+@router.get("/{task_id}/report", response_model=ReportOut)
+async def get_report(task_id: int, session: AsyncSession = Depends(get_session)) -> ReportOut:
+    """报告阅读页数据：markdown + citation_map + 按展示编号排序的信源卡（含摘录）。
+
+    摘录取自笔记正文中引用该信源的句子（锚点已重写为信源库 id），
+    任务无报告时 404（前端据此显示空态）。
+    """
+    task = await session.get(ResearchTask, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task not found")
+    report = (
+        (
+            await session.execute(
+                select(Report).where(Report.task_id == task_id).order_by(Report.id.desc()).limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if report is None:
+        raise HTTPException(status_code=404, detail="report not found")
+
+    citation_map: dict[str, int] = {
+        str(n): int(sid) for n, sid in (report.citation_map or {}).items()
+    }
+    cited_ids = sorted(set(citation_map.values()))
+
+    source_rows: dict[int, Source] = {}
+    note_contents: list[str] = []
+    if cited_ids:
+        rows = (
+            await session.execute(
+                select(Source).where(Source.task_id == task_id, Source.id.in_(cited_ids))
+            )
+        ).scalars().all()
+        source_rows = {s.id: s for s in rows}
+        note_contents = list(
+            (
+                await session.execute(
+                    select(Note.content).where(Note.task_id == task_id).order_by(Note.id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+
+    sources = [
+        ReportSourceOut(
+            no=int(no),
+            id=s.id,
+            url=s.url,
+            title=s.title,
+            domain=s.domain,
+            credibility=s.credibility,
+            freshness=s.freshness,
+            excerpts=extract_excerpts(note_contents, s.id),
+        )
+        for no, sid in sorted(citation_map.items(), key=lambda kv: int(kv[0]))
+        if (s := source_rows.get(sid)) is not None
+    ]
+    return ReportOut(
+        report_id=report.id,
+        task_id=task_id,
+        question=task.question,
+        depth=task.depth,
+        markdown=report.markdown,
+        citation_map=citation_map,
+        token_total=report.token_total,
+        cost_cny=task.cost_cny,
+        sources=sources,
+    )
 
 
 @router.get("/{task_id}/events", response_model=list[EventOut])

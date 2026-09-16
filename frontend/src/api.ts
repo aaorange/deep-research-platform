@@ -1,4 +1,4 @@
-import type { AgentEvent, Depth, SourceOut, TaskDetail, TaskOut } from "./types";
+import type { AgentEvent, Depth, ReportOut, SourceOut, TaskDetail, TaskOut } from "./types";
 
 const BASE = "/api/research/tasks";
 
@@ -31,6 +31,9 @@ export const controlTask = (id: number, action: "pause" | "resume" | "stop") =>
   });
 
 export const listSources = (id: number) => req<SourceOut[]>(`/${id}/sources`);
+
+/** 报告阅读页数据：markdown + citation_map + 带摘录的信源卡（无报告时 404）。 */
+export const getReport = (id: number) => req<ReportOut>(`/${id}/report`);
 
 export const listEvents = (id: number, afterSeq = 0) =>
   req<AgentEvent[]>(`/${id}/events?after_seq=${afterSeq}`);

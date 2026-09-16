@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import * as api from "./api";
 import { ActionStream } from "./components/ActionStream";
 import { CostPanel } from "./components/CostPanel";
+import { ReportView } from "./components/ReportView";
 import { StatusBadge, TaskList } from "./components/TaskList";
 import { SourcesPanel } from "./components/SourcesPanel";
 import { SubTaskChecklist } from "./components/SubTaskChecklist";
@@ -19,7 +20,11 @@ export default function App() {
   const [question, setQuestion] = useState("");
   const [depth, setDepth] = useState<Depth>("std");
   const [creating, setCreating] = useState(false);
+  const [showReport, setShowReport] = useState(false);
   const refreshTimer = useRef<number | null>(null);
+  // 本次选中期间是否见过运行态：只有「观看中转 done」才自动打开报告，
+  // 历史 done 任务选中时 SSE 秒发 end，不应跳页
+  const sawLiveRef = useRef(false);
 
   const { connected, ended, events } = useTaskStream(selectedId);
 
@@ -56,6 +61,8 @@ export default function App() {
     if (selectedId === null) return;
     setDetail(null);
     setSources([]);
+    setShowReport(false);
+    sawLiveRef.current = false;
     loadDetail(selectedId);
   }, [selectedId, loadDetail]);
 
@@ -71,13 +78,18 @@ export default function App() {
     }, 400);
   }, [events, selectedId, loadDetail, loadTasks]);
 
-  // 终态：最终刷新（成本/报告落库）
+  // 终态：最终刷新（成本/报告落库）；研究完成自动进入报告阅读页（仅限观看中的运行任务）
   useEffect(() => {
     if (ended && selectedId !== null) {
       loadDetail(selectedId);
       loadTasks();
+      if (ended === "done" && sawLiveRef.current) setShowReport(true);
     }
   }, [ended, selectedId, loadDetail, loadTasks]);
+
+  useEffect(() => {
+    if (["queued", "running", "paused"].includes(detail?.status ?? "")) sawLiveRef.current = true;
+  }, [detail?.status]);
 
   // SSE 断连兜底：非终态任务每 5s 轮询
   useEffect(() => {
@@ -93,6 +105,7 @@ export default function App() {
     try {
       const t = await api.createTask(q, depth);
       setQuestion("");
+      setShowReport(false);
       setSelectedId(t.id);
       await loadTasks();
     } finally {
@@ -111,6 +124,7 @@ export default function App() {
   const canPause = status === "running";
   const canResume = status === "paused" || status === "failed";
   const canStop = ["queued", "running", "paused"].includes(status);
+  const canReport = status === "done";
   const doneSubs = detail?.sub_tasks.filter((s) => s.status === "done").length ?? 0;
 
   return (
@@ -138,7 +152,10 @@ export default function App() {
         </div>
       </header>
 
-      <div className="workbench">
+      {showReport && selectedId !== null ? (
+        <ReportView taskId={selectedId} onBack={() => setShowReport(false)} />
+      ) : (
+        <div className="workbench">
         <div className="column">
           <div className="col-header">
             <span className="col-title">任务清单</span>
@@ -168,6 +185,11 @@ export default function App() {
             {detail ? (
               <div className="ctrl">
                 <StatusBadge status={status} />
+                {canReport && (
+                  <button className="btn" onClick={() => setShowReport(true)}>
+                    查看报告
+                  </button>
+                )}
                 {canPause && (
                   <button className="btn warn" onClick={() => control("pause")}>
                     ⏸ 暂停
@@ -201,7 +223,8 @@ export default function App() {
             <SourcesPanel sources={sources} />
           </div>
         </div>
-      </div>
+        </div>
+      )}
     </>
   );
 }

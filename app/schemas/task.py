@@ -88,5 +88,30 @@ class SourceOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ReportSourceOut(BaseModel):
+    """报告阅读页信源卡：展示编号 + 信源元数据 + 从笔记提取的摘录。"""
+
+    no: int = Field(description="报告中的展示编号 [n]")
+    id: int = Field(description="信源库 id")
+    url: str
+    title: str | None
+    domain: str | None
+    credibility: int | None
+    freshness: float | None
+    excerpts: list[str] = Field(default_factory=list)
+
+
+class ReportOut(BaseModel):
+    report_id: int
+    task_id: int
+    question: str
+    depth: str
+    markdown: str
+    citation_map: dict[str, int] = Field(description="展示编号 → 信源库 id")
+    token_total: int
+    cost_cny: float
+    sources: list[ReportSourceOut] = Field(description="按展示编号排序的被引用信源")
+
+
 def now_utc() -> datetime:
     return datetime.now(UTC)

@@ -45,6 +45,32 @@ export interface SourceOut {
   freshness: number | null;
 }
 
+export interface ReportSource {
+  /** 报告中的展示编号 [n] */
+  no: number;
+  id: number;
+  url: string;
+  title: string | null;
+  domain: string | null;
+  credibility: number | null;
+  freshness: number | null;
+  /** 从笔记中提取的该信源摘录 */
+  excerpts: string[];
+}
+
+export interface ReportOut {
+  report_id: number;
+  task_id: number;
+  question: string;
+  depth: Depth;
+  markdown: string;
+  /** 展示编号 → 信源库 id */
+  citation_map: Record<string, number>;
+  token_total: number;
+  cost_cny: number;
+  sources: ReportSource[];
+}
+
 export interface AgentEvent {
   seq: number;
   task_id: number;
