@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.db import (
@@ -360,6 +360,104 @@ async def test_execute_research_marks_failed_on_exception(session_maker, monkeyp
         task = await session.get(ResearchTask, task_id)
         assert task.status == TaskStatus.failed
         assert "reasoner 503" in task.error_msg
+
+
+def make_interrupting_worker(maker, mode):
+    """模拟执行中用户干预：pause=置任务 paused；steal=改写 run_token 模拟 resume 新 job 接管。"""
+    ran = []
+
+    async def run_worker(task_id, sub_task, max_pages):
+        ran.append(sub_task["id"])
+        async with maker() as session:
+            p = SubTaskPersister(session)
+            await p.mark_sub_task_status(sub_task["id"], SubTaskStatus.done)
+            if sub_task["id"] == 1:
+                values = (
+                    {"status": TaskStatus.paused}
+                    if mode == "pause"
+                    else {"run_token": "new-job-token"}
+                )
+                await session.execute(
+                    update(ResearchTask).where(ResearchTask.id == task_id).values(**values)
+                )
+                await session.commit()
+        return {
+            "sub_task_id": sub_task["id"],
+            "title": sub_task["title"],
+            "note": {"summary": "n"},
+            "sources": [],
+            "note_tokens": 0,
+            "error": None,
+        }
+
+    run_worker.ran = ran
+    return run_worker
+
+
+def patch_interrupting(monkeypatch, maker, mode):
+    outline = PlanOutline(
+        sub_tasks=[PlanSubTask(title=f"子问题{i}", keywords=f"k{i}") for i in range(1, 4)]
+    )
+    monkeypatch.setattr(orchestrator, "write_plan", fake_plan(outline))
+    monkeypatch.setattr(
+        orchestrator,
+        "make_sub_task_runner",
+        lambda verbose=False: make_interrupting_worker(maker, mode),
+    )
+    monkeypatch.setattr(orchestrator, "write_report", fake_report())
+    monkeypatch.setattr(orchestrator, "reflect_on_coverage", fake_reflect())
+    monkeypatch.setattr(
+        orchestrator, "open_graph_checkpointer", lambda: nullcontext(InMemorySaver())
+    )
+    return make_interrupting_worker(maker, mode)
+
+
+async def test_execute_research_superseded_on_pause(session_maker, monkeypatch):
+    """飞行中暂停 e2e：旧 job 围栏退出（不误标 failed），任务保持 paused 等待 resume。"""
+    task_id = await _make_task(session_maker)
+    patch_interrupting(monkeypatch, session_maker, "pause")
+
+    result = await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    assert result == {"task_id": task_id, "status": "superseded"}
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        assert task.status == TaskStatus.paused  # 旧 job 未覆盖为 failed/done
+        assert task.error_msg is None
+        assert task.finished_at is None
+        reports = list(await session.scalars(select(Report).where(Report.task_id == task_id)))
+        assert reports == []  # 旧 job 未产出报告（新 job resume 后幂等补齐）
+
+
+async def test_execute_research_superseded_by_new_job(session_maker, monkeypatch):
+    """resume 抢占 e2e：令牌被新 job 改写后，旧 job 退出且不把任务误标终态。"""
+    task_id = await _make_task(session_maker)
+    patch_interrupting(monkeypatch, session_maker, "steal")
+
+    result = await orchestrator.execute_research(task_id, session_maker=session_maker)
+
+    assert result == {"task_id": task_id, "status": "superseded"}
+    async with session_maker() as session:
+        task = await session.get(ResearchTask, task_id)
+        assert task.status == TaskStatus.running  # 归新 job 所有
+        assert task.run_token == "new-job-token"
+        assert task.error_msg is None  # 未被旧 job 的 finish_task 抹成 failed
+        assert task.finished_at is None
+
+
+async def test_persist_report_idempotent_on_duplicate(session_maker):
+    """reports.task_id 唯一约束兜底：同任务二次落报告返回既有 ID，不抛 IntegrityError。"""
+    task_id = await _make_task(session_maker)
+    async with session_maker() as session:
+        p = SubTaskPersister(session)
+        rid1 = await p.persist_report(task_id, "# v1", {1: 101}, 100)
+        rid2 = await p.persist_report(task_id, "# v2", {1: 102}, 200)
+
+    assert rid1 == rid2
+    async with session_maker() as session:
+        rows = list(await session.scalars(select(Report).where(Report.task_id == task_id)))
+        assert len(rows) == 1
+        assert rows[0].markdown == "# v1"  # 既有报告保留
 
 
 async def test_execute_research_rejects_terminal_status(session_maker):

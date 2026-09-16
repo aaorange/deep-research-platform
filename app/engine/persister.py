@@ -8,6 +8,7 @@ DeepSeek 官方定价（2025，缓存未命中）：
 from datetime import UTC, datetime
 
 from sqlalchemy import select, text, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import (
@@ -122,6 +123,17 @@ class SubTaskPersister:
             )
         ).first()
         return (row.token_used, row.token_budget) if row else (0, 0)
+
+    async def task_run_state(self, task_id: int) -> tuple[TaskStatus | None, str | None]:
+        """新鲜读 (status, run_token)：job 围栏检查用，绕过 identity map。"""
+        row = (
+            await self.session.execute(
+                select(ResearchTask.status, ResearchTask.run_token).where(
+                    ResearchTask.id == task_id
+                )
+            )
+        ).first()
+        return (row.status, row.run_token) if row else (None, None)
 
     async def mark_sub_task_status(
         self, sub_task_id: int, status: SubTaskStatus, error: str | None = None
@@ -243,10 +255,30 @@ class SubTaskPersister:
             token_total=token_total,
         )
         self.session.add(row)
-        await self.session.commit()
-        return row.id
+        try:
+            await self.session.commit()
+            return row.id
+        except IntegrityError:
+            # 并发窗口内另一 job 已落报告：唯一约束兜底，返回既有报告
+            await self.session.rollback()
+            existing = await self.session.execute(
+                select(Report.id)
+                .where(Report.task_id == task_id)
+                .order_by(Report.id.desc())
+                .limit(1)
+            )
+            return existing.scalar_one()
 
-    async def mark_task_running(self, task_id: int, thread_id: str | None = None) -> None:
+    async def latest_report(self, task_id: int) -> Report | None:
+        """任务已有报告（synthesize 幂等用）：一任务只保留最新一份。"""
+        result = await self.session.execute(
+            select(Report).where(Report.task_id == task_id).order_by(Report.id.desc()).limit(1)
+        )
+        return result.scalars().first()
+
+    async def mark_task_running(
+        self, task_id: int, thread_id: str | None = None, run_token: str | None = None
+    ) -> None:
         await self.session.execute(
             update(ResearchTask)
             .where(ResearchTask.id == task_id)
@@ -254,14 +286,25 @@ class SubTaskPersister:
                 status=TaskStatus.running,
                 error_msg=None,
                 thread_id=ResearchTask.thread_id if thread_id is None else thread_id,
+                run_token=ResearchTask.run_token if run_token is None else run_token,
             )
         )
         await self.session.commit()
 
-    async def finish_task(self, task_id: int, done: bool, error: str | None = None) -> None:
+    async def finish_task(
+        self, task_id: int, done: bool, error: str | None = None, run_token: str | None = None
+    ) -> None:
+        """终态回写：仅在 running 且（传入时）令牌仍归本 job 时生效。
+
+        暂停/终止/被 resume 新 job 抢占的场景，状态归控制方或新 job 所有，
+        旧 job 不得覆盖。
+        """
+        conditions = [ResearchTask.id == task_id, ResearchTask.status == TaskStatus.running]
+        if run_token is not None:
+            conditions.append(ResearchTask.run_token == run_token)
         await self.session.execute(
             update(ResearchTask)
-            .where(ResearchTask.id == task_id)
+            .where(*conditions)
             .values(
                 status=TaskStatus.done if done else TaskStatus.failed,
                 error_msg=error,

@@ -7,6 +7,7 @@ import pytest
 from app.config import get_settings
 from app.db import EventType
 from app.engine.main_graph import (
+    JobSupersededError,
     OrchestratorDeps,
     build_main_graph,
     merge_worker_results,
@@ -40,6 +41,8 @@ class FakeStore:
         self.instructions: list[dict] = instructions or []  # 追加指示信箱
         self.consumed_rounds: list[int] = []
         self.token_budget = token_budget  # 0 = 不限额（永不降级）
+        self.task_status = "running"  # 围栏检查读到的任务状态
+        self.current_run_token = None  # 围栏检查读到的当前令牌（None=无 job 认领）
         self._next_id = 1
         self._next_report_id = 1
 
@@ -90,6 +93,15 @@ class FakeStore:
     async def task_budget_state(self, task_id):
         used = sum(p + c for _, _, p, c in self.usage_calls)
         return used, self.token_budget
+
+    async def task_run_state(self, task_id):
+        return self.task_status, self.current_run_token
+
+    async def latest_report(self, task_id):
+        if not self.reports:
+            return None
+        r = self.reports[-1]
+        return SimpleNamespace(id=r["id"], markdown=r["markdown"], citation_map=r["citation_map"])
 
     async def pending_instructions(self, task_id):
         return [i for i in self.instructions if i.get("consumed_round") is None]
@@ -822,3 +834,95 @@ async def test_zero_subtasks_routes_to_end():
 
     assert final.get("executed") is None  # execute 节点未运行
     assert worker.calls == []
+
+
+async def test_synthesize_reuses_existing_report():
+    """报告幂等：重入时已有报告 → 不再调 reasoner，直接复用既有报告。"""
+    store = FakeStore()
+    store.reports.append(
+        {
+            "id": 7,
+            "task_id": 1,
+            "markdown": "# 旧报告",
+            "citation_map": {1: 101, 2: 102},
+            "token_total": 999,
+        }
+    )
+    report = make_report()
+    recorder = FakeRecorder()
+    deps = make_deps(report=report, store=store, recorder=recorder)
+
+    graph = build_main_graph(deps)
+    final = await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick"})
+
+    assert report.calls == []  # 未调 reasoner
+    assert final["report_id"] == 7  # 复用既有报告
+    assert final["report_chars"] == len("# 旧报告")
+    assert final["citations"] == 2
+    assert len(store.reports) == 1  # 无新报告落库
+    control = [e for e in recorder.events if e["type"] == EventType.control]
+    assert control[-1]["payload"] == {"stage": "synthesize", "info": "report exists, skip"}
+
+
+async def test_fencing_aborts_when_task_paused():
+    """围栏：任务已暂停（pause）→ 图在 plan 入口即中止，子任务不执行。"""
+    store = FakeStore()
+    store.task_status = "paused"
+    worker = make_worker(store=store)
+    recorder = FakeRecorder()
+    deps = make_deps(worker=worker, store=store, recorder=recorder)
+
+    graph = build_main_graph(deps)
+    with pytest.raises(JobSupersededError):
+        await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick", "run_token": "tok-1"})
+
+    assert worker.calls == []
+    abort = [e for e in recorder.events if e["type"] == EventType.control]
+    assert abort[-1]["payload"] == {"stage": "job", "info": "abort: task paused"}
+
+
+async def test_fencing_aborts_when_token_superseded():
+    """围栏：resume 后新 job 抢占令牌 → 旧 job 中止。"""
+    store = FakeStore()
+    store.current_run_token = "tok-new"
+    worker = make_worker(store=store)
+    deps = make_deps(worker=worker, store=store)
+
+    graph = build_main_graph(deps)
+    with pytest.raises(JobSupersededError):
+        await graph.ainvoke(
+            {"task_id": 1, "question": "q", "depth": "quick", "run_token": "tok-old"}
+        )
+
+    assert worker.calls == []
+
+
+async def test_fencing_mid_run_pause_blocks_queued_subtasks():
+    """飞行中暂停：排队中的子任务拿到槽位后复查退出，不发起 LLM 调用。"""
+    store = FakeStore()
+    store.current_run_token = "tok-1"  # 令牌归本 job（模拟 mark_task_running 已认领）
+    started = []
+
+    async def run_worker(task_id, sub_task, max_pages):
+        started.append(sub_task["id"])
+        if sub_task["id"] == 1:
+            store.task_status = "paused"  # 用户在首个子任务执行中点了暂停
+        await asyncio.sleep(0.01)
+        return {
+            "sub_task_id": sub_task["id"],
+            "title": sub_task["title"],
+            "note": {"summary": "n"},
+            "sources": [],
+            "note_tokens": 1,
+            "error": None,
+        }
+
+    deps = make_deps(make_plan(make_outline(4)), run_worker, store=store, max_parallel=1)
+
+    graph = build_main_graph(deps)
+    with pytest.raises(JobSupersededError):
+        await graph.ainvoke({"task_id": 1, "question": "q", "depth": "quick", "run_token": "tok-1"})
+
+    # 只有子任务 1 真正执行，2/3/4 在槽位边界被围栏拦下
+    assert started == [1]
+    assert [r["status"] for r in store.rows if r["id"] > 1] == ["pending"] * 3

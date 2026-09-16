@@ -5,12 +5,18 @@
 """
 
 import logging
+import uuid
 
 from app.db import ResearchTask, TaskStatus
 from app.db.base import SessionLocal
 from app.engine.budget import is_degraded
 from app.engine.checkpoint import open_graph_checkpointer, thread_id_for_task
-from app.engine.main_graph import DEFAULT_MAX_PAGES, OrchestratorDeps, build_main_graph
+from app.engine.main_graph import (
+    DEFAULT_MAX_PAGES,
+    JobSupersededError,
+    OrchestratorDeps,
+    build_main_graph,
+)
 from app.engine.persister import SubTaskPersister
 from app.engine.planner import write_plan
 from app.engine.reflector import reflect_on_coverage
@@ -43,7 +49,8 @@ async def execute_research(
             raise ValueError(f"task {task_id} in terminal status {task.status.value}")
 
         persister = SubTaskPersister(session)
-        await persister.mark_task_running(task_id, thread_id_for_task(task_id))
+        run_token = uuid.uuid4().hex
+        await persister.mark_task_running(task_id, thread_id_for_task(task_id), run_token=run_token)
 
         question, background, depth = task.question, task.background, task.depth
         recorder = PrintingRecorder(session) if verbose else EventRecorder(session)
@@ -66,18 +73,28 @@ async def execute_research(
                         "background": background,
                         "depth": depth,
                         "max_pages": max_pages,
+                        "run_token": run_token,
                     },
                     config={"configurable": {"thread_id": thread_id_for_task(task_id)}},
                 )
+            except JobSupersededError:
+                # 本 job 已被暂停/终止或被 resume 的新 job 抢占：
+                # 任务状态归控制方/新 job 所有，不回写终态、安静退出
+                logger.info("task %s superseded (token %s), job exits", task_id, run_token[:8])
+                return {"task_id": task_id, "status": "superseded"}
             except Exception as e:
-                await persister.finish_task(task_id, done=False, error=f"{type(e).__name__}: {e}")
+                await persister.finish_task(
+                    task_id, done=False, error=f"{type(e).__name__}: {e}", run_token=run_token
+                )
                 raise
 
         has_report = bool(final.get("report_id"))
         if not has_report:
-            await persister.finish_task(task_id, done=False, error="no notes or report produced")
+            await persister.finish_task(
+                task_id, done=False, error="no notes or report produced", run_token=run_token
+            )
         else:
-            await persister.finish_task(task_id, done=True)
+            await persister.finish_task(task_id, done=True, run_token=run_token)
 
         # 补充轮后 state 只含末轮产物，笔记/信源从 DB 取全量
         all_notes, all_sources = await persister.synthesis_inputs(task_id)

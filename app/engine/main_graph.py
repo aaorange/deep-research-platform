@@ -28,7 +28,7 @@ from typing import Literal, Protocol, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from app.config import get_settings
-from app.db import EventType
+from app.db import EventType, TaskStatus
 from app.engine.budget import budget_payload, disclaimer_md, is_degraded
 from app.engine.planner import DEPTH_SUBTASK_COUNT, PlanOutline, default_outline
 from app.engine.reflector import Reflection, instruction_to_sub_task
@@ -41,12 +41,21 @@ MAX_REFLECT_ROUNDS = 2  # 补充轮上限（不含首轮 execute）
 MAX_GAPS_PER_ROUND = 3
 
 
+class JobSupersededError(Exception):
+    """任务已被暂停/终止，或 run_token 被新一次执行抢占。
+
+    编排器捕获后直接退出：不回写任务状态（状态由控制方或新 job 拥有），
+    防止旧 job 与 resume 后的新 job 并发执行同一任务。
+    """
+
+
 class MainState(TypedDict, total=False):
     task_id: int
     question: str
     background: str | None
     depth: str
     max_pages: int
+    run_token: str  # job 所有权令牌（编排器生成，围栏检查用）
 
     # plan 节点输出
     sub_tasks: list[dict]  # [{id, title, keywords}]
@@ -109,6 +118,10 @@ class SubTaskStoreProtocol(Protocol):
     async def skip_pending_sub_tasks(self, task_id: int) -> int: ...
 
     async def task_budget_state(self, task_id: int) -> tuple[int, int]: ...
+
+    async def task_run_state(self, task_id: int) -> tuple[object, str | None]: ...
+
+    async def latest_report(self, task_id: int) -> object | None: ...
 
     async def all_sub_tasks(self, task_id: int) -> list[dict]: ...
 
@@ -181,8 +194,28 @@ def merge_worker_results(results: list[dict]) -> dict:
 
 
 def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
+    async def _ensure_job_current(task_id: int, run_token: str | None) -> None:
+        """job 围栏：任务已暂停/终止或令牌被新 run 抢占时中止本 job。
+
+        run_token 未提供（单测直跑图/旧调用方）时跳过检查，保持向后兼容。
+        """
+        if not run_token:
+            return
+        status, current = await deps.store.task_run_state(task_id)
+        if status != TaskStatus.running or current != run_token:
+            reason = (
+                f"task {getattr(status, 'value', status)}"
+                if status != TaskStatus.running
+                else "superseded"
+            )
+            await deps.recorder.record(
+                task_id, EventType.control, {"stage": "job", "info": f"abort: {reason}"}
+            )
+            raise JobSupersededError(reason)
+
     async def plan_node(state: MainState) -> dict:
         task_id = state["task_id"]
+        await _ensure_job_current(task_id, state.get("run_token"))
 
         # resume 幂等：子任务已落库（前次执行崩溃/被 kill）则跳过重规划，
         # 避免续跑重复建任务重复计费
@@ -252,6 +285,9 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
     async def execute_node(state: MainState) -> dict:
         task_id = state["task_id"]
         max_pages = state.get("max_pages", DEFAULT_MAX_PAGES)
+        run_token = state.get("run_token")
+
+        await _ensure_job_current(task_id, run_token)
 
         # 预算降级：入口即超阈值则跳过剩余子任务（首轮极小预算或续跑超支）
         used, budget = await deps.store.task_budget_state(task_id)
@@ -280,10 +316,18 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
         sem = asyncio.Semaphore(deps.max_parallel)
 
         async def run_one(sub_task: dict) -> dict:
+            # 子任务边界围栏：在拿到并发槽位后、发起 LLM 调用前复查，
+            # 暂停/抢占对"已排队未起飞"的子任务同样生效（飞行中的不可中断）
             async with sem:
+                await _ensure_job_current(task_id, run_token)
                 return await deps.run_worker(task_id, sub_task, max_pages)
 
-        results = await asyncio.gather(*[run_one(st) for st in pending])
+        # return_exceptions：等在飞行子任务全部落地后再统一上抛（含围栏中止），
+        # 避免孤儿任务继续写库
+        results = await asyncio.gather(*[run_one(st) for st in pending], return_exceptions=True)
+        for r in results:
+            if isinstance(r, BaseException):
+                raise r
         merged = merge_worker_results(list(results))
 
         await deps.recorder.record(
@@ -317,6 +361,7 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
         """
         task_id = state["task_id"]
         rounds = state.get("reflect_rounds", 0)
+        await _ensure_job_current(task_id, state.get("run_token"))
 
         if rounds >= MAX_REFLECT_ROUNDS:
             await deps.recorder.record(
@@ -439,6 +484,22 @@ def build_main_graph(deps: OrchestratorDeps, checkpointer=None):
 
     async def synthesize_node(state: MainState) -> dict:
         task_id = state["task_id"]
+        await _ensure_job_current(task_id, state.get("run_token"))
+
+        # 报告幂等：崩溃恢复/并发窗口内已产出报告 → 不再重复调 LLM
+        existing = await deps.store.latest_report(task_id)
+        if existing is not None:
+            await deps.recorder.record(
+                task_id,
+                EventType.control,
+                {"stage": "synthesize", "info": "report exists, skip"},
+            )
+            return {
+                "report_id": existing.id,
+                "report_chars": len(existing.markdown),
+                "citations": len(existing.citation_map or {}),
+            }
+
         # 从 DB 读全量笔记/信源（非 state）：resume 后续跑也拿得到历史轮产物
         notes, sources = await deps.store.synthesis_inputs(task_id)
 

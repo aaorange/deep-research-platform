@@ -60,6 +60,11 @@ class ResearchTask(Base):
         Enum(TaskStatus, name="task_status"), default=TaskStatus.queued
     )
     thread_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    run_token: Mapped[str | None] = mapped_column(
+        String(36),
+        default=None,
+        comment="job 所有权令牌：resume 重入后旧 job 凭此退出，防并发重复执行",
+    )
     token_budget: Mapped[int] = mapped_column(Integer, default=0)
     token_used: Mapped[int] = mapped_column(Integer, default=0)
     cost_cny: Mapped[float] = mapped_column(Float, default=0.0)
@@ -156,7 +161,7 @@ class Report(Base):
     __tablename__ = "reports"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), index=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("research_tasks.id"), unique=True)
     version: Mapped[int] = mapped_column(Integer, default=1)
     markdown: Mapped[str] = mapped_column(Text)
     chart_specs: Mapped[dict | None] = mapped_column(JSONB, default=None)
