@@ -5,7 +5,7 @@
 """
 
 import sys
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -23,9 +23,18 @@ def _psycopg_url(asyncpg_url: str) -> str:
     return asyncpg_url.replace("+asyncpg", "")
 
 
-def open_checkpointer() -> AsyncPostgresSaver:
-    """返回 async with 用的上下文管理器，进入时自动建表。"""
-    return AsyncPostgresSaver.from_conn_string(_psycopg_url(get_settings().database_url))
+@asynccontextmanager
+async def open_checkpointer():
+    """async with 用检查点：进入时 setup 建表（幂等，CREATE TABLE IF NOT EXISTS）。
+
+    注意：from_conn_string 本身不建表，必须显式 setup()——全新数据库
+    （如部署环境首跑）缺少 checkpoints 表会直接 UndefinedTable。
+    """
+    async with AsyncPostgresSaver.from_conn_string(
+        _psycopg_url(get_settings().database_url)
+    ) as saver:
+        await saver.setup()
+        yield saver
 
 
 def open_graph_checkpointer():
